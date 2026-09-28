@@ -125,24 +125,8 @@ def main():
         assert body.count("# UUID=abc swap swap defaults 0 0") == 1, body
     passed.append("_comment_swap_fstab")
 
-    # 10. _set_sysctl 文本变换逻辑 (不真正调用 sysctl 二进制)
-    def fake_set_sysctl(key, value, cfg):
-        content = open(cfg).read() if os.path.exists(cfg) else ""
-        pattern = rf"^\s*{re.escape(key)}\s*=\s*\S+"
-        if re.search(pattern, content, re.MULTILINE):
-            content = re.sub(pattern, f"{key} = {value}", content, flags=re.MULTILINE)
-        else:
-            content = content.rstrip() + f"\n# >>>\n{key} = {value}\n# <<<\n"
-        with open(cfg, "w") as f:
-            f.write(content)
-
-    with tempfile.TemporaryDirectory() as d:
-        target = os.path.join(d, "sysctl.conf")
-        for _ in range(3):
-            fake_set_sysctl("net.ipv4.tcp_max_tw_buckets", "10000", target)
-        body = open(target).read()
-        assert body.count("net.ipv4.tcp_max_tw_buckets = 10000") == 1, body
-    passed.append("_set_sysctl (文本变换)")
+    # 10. sysctl 已不再被本脚本修改, 故不测试.
+    passed.append("(sysctl 不再修改, 跳过)")
 
     # 11. _append_rc_local
     with tempfile.TemporaryDirectory() as d:
@@ -156,7 +140,7 @@ def main():
         assert body.count(gpc.MANAGED_END) == 1, body
     passed.append("_append_rc_local")
 
-    print(f"✅ {len(passed)} 个文件修改函数全部幂等通过:")
+    print(f"✅ {len([p for p in passed if not p.startswith('(')])} 个文件修改函数全部幂等通过:")
     for name in passed:
         print(f"   - {name}")
 

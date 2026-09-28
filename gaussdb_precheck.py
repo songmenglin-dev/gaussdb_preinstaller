@@ -40,42 +40,9 @@ if sys.version_info < (3, 7):
 MANAGED_BEGIN = "# >>> gaussdb_precheck managed >>>"
 MANAGED_END   = "# <<< gaussdb_precheck managed <<<"
 
-# 由文档表 1-3 整理
-SYSCTL_PARAMS = {
-    "net.ipv4.tcp_max_tw_buckets":   "10000",
-    "net.ipv4.tcp_tw_reuse":         "1",
-    "net.ipv4.tcp_tw_recycle":       "1",
-    "net.ipv4.tcp_keepalive_time":   "30",
-    "net.ipv4.tcp_keepalive_probes": "9",
-    "net.ipv4.tcp_keepalive_intvl":  "30",
-    "net.ipv4.tcp_retries1":         "5",
-    "net.ipv4.tcp_syn_retries":      "5",
-    "net.ipv4.tcp_synack_retries":   "5",
-    "net.ipv4.tcp_retries2":         "12",
-    "vm.overcommit_memory":          "0",
-    "net.ipv4.tcp_rmem":             "8192 250000 16777216",
-    "net.ipv4.tcp_wmem":             "8192 250000 16777216",
-    "net.core.wmem_max":             "21299200",
-    "net.core.rmem_max":             "21299200",
-    "net.core.wmem_default":         "21299200",
-    "net.core.rmem_default":         "21299200",
-    "net.ipv4.ip_local_port_range":  "26000 65535",
-    "kernel.sem":                    "250 6400000 1000 25600",
-    "net.core.somaxconn":            "65535",
-    "net.ipv4.tcp_syncookies":       "1",
-    "net.core.netdev_max_backlog":   "65535",
-    "net.ipv4.tcp_max_syn_backlog":  "65535",
-    "net.ipv4.tcp_fin_timeout":      "60",
-    "kernel.shmall":                 "1152921504606846720",
-    "kernel.shmmax":                 "18446744073709551615",
-    "net.ipv4.tcp_sack":             "1",
-    "net.ipv4.tcp_timestamps":       "1",
-    "vm.extfrag_threshold":          "500",
-    "vm.overcommit_ratio":           "90",
-}
-
-# 涉及多行参数，每行都视作独立检查项（便于在表格中分开展示）
-SYSCTL_TABLE_ROWS = [(k, v) for k, v in SYSCTL_PARAMS.items()]
+# 注意：本脚本不主动修改 sysctl 类操作系统参数（如 net.ipv4.tcp_max_tw_buckets、
+# net.core.*、vm.overcommit_*、kernel.sem/shmall/shmmax 等）。这些参数会显著改变
+# 主机的网络/内存行为，可能影响同机部署的其他应用；按需由运维人员手动评估修改。
 
 # --------------------------------------------------------------------------- #
 # 通用工具
@@ -459,33 +426,6 @@ def _set_hist(profile: str, path: str = "/etc/profile") -> None:
     write_file(path, profile)
 
 
-def check_sysctl() -> List[CheckItem]:
-    items: List[CheckItem] = []
-    for key, want in SYSCTL_TABLE_ROWS:
-        rc, out, _ = run(f"sysctl -n {key}")
-        current = out.strip() if rc == 0 else "(未设置)"
-        items.append(CheckItem(
-            name=f"sysctl {key}",
-            expected=want,
-            current=current,
-            ok=current == want,
-            fix=lambda k=key, v=want: _set_sysctl(k, v),
-        ))
-    return items
-
-
-def _set_sysctl(key: str, value: str, cfg: str = "/etc/sysctl.conf") -> None:
-    run(f"sysctl -w {key}={value}", check=False)
-    content = read_file(cfg) or ""
-    pattern = rf"^\s*{re.escape(key)}\s*=\s*\S+"
-    if re.search(pattern, content, re.MULTILINE):
-        content = re.sub(pattern, f"{key} = {value}", content, flags=re.MULTILINE)
-    else:
-        content = content.rstrip() + f"\n{MANAGED_BEGIN}\n{key} = {value}\n{MANAGED_END}\n"
-    write_file(cfg, content)
-    run("sysctl -p", check=False)
-
-
 def check_filehandles() -> List[CheckItem]:
     items: List[CheckItem] = []
     cfg = "/etc/security/limits.conf"
@@ -643,7 +583,6 @@ CHECK_GROUPS: List[Tuple[str, Callable[[], List[CheckItem]]]] = [
     ("Swap", check_swap),
     ("网卡 MTU", check_mtu),
     ("HISTORY 记录", check_history),
-    ("操作系统参数 sysctl", check_sysctl),
     ("文件句柄 / 进程数", lambda: check_filehandles() + check_nproc()),
     ("透明大页 / cgroup", lambda: check_thp() + check_cgroup()),
 ]
