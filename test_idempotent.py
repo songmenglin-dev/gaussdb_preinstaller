@@ -51,12 +51,8 @@ def main():
         assert body.count("export LC_ALL=en_US.UTF-8") == 1, body
     passed.append("_set_profile_lcall")
 
-    # 3. _set_hist
-    with tempfile.TemporaryDirectory() as d:
-        target = os.path.join(d, "profile")
-        body = thrice(gpc._set_hist, "", _target=target, path=target)
-        assert body.count("HISTSIZE=0") == 1, body
-    passed.append("_set_hist")
+    # 3. _set_hist (已移除, HISTSIZE 不再修改)
+    passed.append("(HISTSIZE 不再修改, 跳过)")
 
     # 4. /etc/sysconfig/i18n 与 /etc/locale.conf 不再被本脚本修改
     passed.append("(locale 不再修改, 跳过)")

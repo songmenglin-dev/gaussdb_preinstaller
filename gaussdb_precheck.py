@@ -387,29 +387,6 @@ def _mtu_expected() -> str:
     return "8192" if get_arch() == "aarch64" else "1500"
 
 
-def check_history() -> List[CheckItem]:
-    profile = read_file("/etc/profile")
-    m = re.search(r"^\s*HISTSIZE\s*=\s*(\S+)", profile, re.MULTILINE) if profile else None
-    current = m.group(1) if m else "(未设置)"
-    items = [CheckItem(
-        name="/etc/profile HISTSIZE",
-        expected="0",
-        current=current,
-        ok=current == "0",
-        fix=lambda: _set_hist(profile),
-    )]
-    return items
-
-
-def _set_hist(profile: str, path: str = "/etc/profile") -> None:
-    profile = profile or ""
-    if re.search(r"^\s*HISTSIZE\s*=", profile, re.MULTILINE):
-        profile = re.sub(r"^\s*HISTSIZE\s*=\s*\S+", "HISTSIZE=0", profile, flags=re.MULTILINE)
-    else:
-        profile = profile.rstrip() + f"\n{MANAGED_BEGIN}\nHISTSIZE=0\n{MANAGED_END}\n"
-    write_file(path, profile)
-
-
 def check_limits() -> List[CheckItem]:
     """合并检查 limits.conf 的文件句柄与进程数 (期望值统一为 1000000)。
 
@@ -582,7 +559,6 @@ CHECK_GROUPS: List[Tuple[str, Callable[[], List[CheckItem]]]] = [
     ("时区与时钟源", lambda: check_timezone() + check_clock_service()),
     ("Swap", check_swap),
     ("网卡 MTU (只读)", check_mtu),
-    ("HISTORY 记录", check_history),
     ("文件句柄 / 进程数", check_limits),
     ("透明大页 / cgroup", lambda: check_thp() + check_cgroup()),
 ]
