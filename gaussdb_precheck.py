@@ -19,6 +19,7 @@ import platform
 import re
 import subprocess
 import sys
+import unicodedata
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
@@ -574,6 +575,7 @@ def gather_all() -> List[CheckItem]:
 
 
 def print_table(items: List[CheckItem]) -> None:
+    """按显示宽度（中文/全角字符占 2 列）打印对齐表格。"""
     headers = ("检查项", "当前值", "预期值", "状态")
     rows = []
     for it in items:
@@ -584,12 +586,18 @@ def print_table(items: List[CheckItem]) -> None:
             "OK" if it.ok else "NOT OK",
         ))
 
-    widths = [len(h) for h in headers]
+    # 按显示宽度计算每列最大宽度
+    widths = [_display_width(h) for h in headers]
     for r in rows:
-        widths = [max(w, len(_to_str(c))) for w, c in zip(widths, r)]
+        widths = [max(w, _display_width(_to_str(c))) for w, c in zip(widths, r)]
+
+    def fmt_cell(text: str, w: int) -> str:
+        # 先按显示宽度截断, 再用空格补齐到 w
+        truncated = _truncate_to_width(text, w)
+        return _pad_display(truncated, w)
 
     def fmt_row(r):
-        return "| " + " | ".join(_to_str(c).ljust(w) for c, w in zip(r, widths)) + " |"
+        return "| " + " | ".join(fmt_cell(_to_str(c), w) for c, w in zip(r, widths)) + " |"
 
     sep = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
     print(sep)
@@ -607,9 +615,41 @@ def _to_str(v) -> str:
     return v if v is not None else ""
 
 
+def _display_width(s: str) -> int:
+    """返回字符串在等宽终端里的显示列宽 (CJK/全角算 2 列, 其余 1 列)."""
+    w = 0
+    for ch in s:
+        if unicodedata.east_asian_width(ch) in ("F", "W"):
+            w += 2
+        else:
+            w += 1
+    return w
+
+
+def _truncate_to_width(s: str, max_width: int) -> str:
+    """按显示宽度截断, 尾部追加 … (1 列)"""
+    if _display_width(s) <= max_width:
+        return s
+    out, w = [], 0
+    for ch in s:
+        cw = 2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1
+        if w + cw > max_width - 1:  # 留 1 列给省略号
+            out.append("…")
+            return "".join(out)
+        out.append(ch)
+        w += cw
+    return "".join(out)
+
+
+def _pad_display(s: str, target_width: int) -> str:
+    """右侧补空格, 使最终显示宽度 == target_width."""
+    pad = target_width - _display_width(s)
+    return s + (" " * pad) if pad > 0 else s
+
+
 def _truncate(v: str, n: int = 60) -> str:
-    s = _to_str(v).replace("\n", " ").strip()
-    return s if len(s) <= n else s[: n - 1] + "…"
+    """按显示宽度截断, 默认 60 列."""
+    return _truncate_to_width(_to_str(v).replace("\n", " ").strip(), n)
 
 
 def cmd_check() -> int:
