@@ -49,7 +49,8 @@ MANAGED_END   = "# <<< gaussdb_precheck managed <<<"
 # 通用工具
 # --------------------------------------------------------------------------- #
 
-def run(cmd: str, check: bool = False, shell: bool = True) -> Tuple[int, str, str]:
+def run(cmd: str, check: bool = False, shell: bool = True,
+        timeout: int = 30) -> Tuple[int, str, str]:
     """执行 shell 命令并返回 (rc, stdout, stderr)。"""
     try:
         proc = subprocess.run(
@@ -57,12 +58,14 @@ def run(cmd: str, check: bool = False, shell: bool = True) -> Tuple[int, str, st
             shell=shell,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=timeout,
         )
         out, err = proc.stdout or "", proc.stderr or ""
         if check and proc.returncode != 0:
             raise RuntimeError(f"命令执行失败: {cmd}\n{err}")
         return proc.returncode, out, err
+    except subprocess.TimeoutExpired as e:
+        return 1, "", f"timeout after {timeout}s"
     except Exception as e:  # noqa: BLE001
         return 1, "", str(e)
 
@@ -548,6 +551,182 @@ def check_clock_service() -> List[CheckItem]:
     return items
 
 
+def check_python_version() -> List[CheckItem]:
+    """检查默认 python3 版本是否与当前 OS 的推荐版本一致.
+
+    文档对各 OS 的 python 版本要求:
+      - Kylin / UOS : 3.7.9
+      - HCE / openEuler: 3.9.9
+      - SUSE         : 3.8.5
+    """
+    expected_map = {
+        "kylin": "3.7.9",
+        "uos":   "3.7.9",
+        "hce":   "3.9.9",
+        "suse":  "3.8.5",
+    }
+    os_type = detect_os()
+    expected = expected_map.get(os_type, "(未知 OS, 请确认)")
+
+    rc, out, _ = run("python3 -V")
+    if rc != 0 or not out.strip():
+        return [CheckItem(
+            name="python3 版本",
+            expected=expected,
+            current="(未安装)",
+            ok=False,
+            fix=None,  # 主程序替换风险大, 由运维手工处理
+        )]
+    current = out.strip().replace("Python ", "")
+    return [CheckItem(
+        name="python3 版本",
+        expected=expected,
+        current=current,
+        ok=(current == expected),
+        fix=None,
+    )]
+
+
+def check_hosts() -> List[CheckItem]:
+    """检查 /etc/hosts 中 hostname 的映射不能落在 127.0.0.0/8.
+
+    文档 1.3.6: '实例各个节点 /etc/hosts 文件中的 hostname (通过 hostname 命令获取)
+    不能映射到本地环回地址 (127.0.0.1 - 127.255.255.254) 中, 建议映射到管理 IP'.
+    """
+    rc, hostname, _ = run("hostname")
+    if rc != 0 or not hostname.strip():
+        return [CheckItem(name="/etc/hosts hostname 映射",
+                          expected="非 127.0.0.0/8",
+                          current="(无法获取 hostname)",
+                          ok=False, fix=None)]
+    hostname = hostname.strip()
+
+    hosts = read_file("/etc/hosts")
+    ip = None
+    if hosts:
+        for ln in hosts.splitlines():
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = s.split()
+            if len(parts) >= 2 and hostname in parts[1:]:
+                ip = parts[0]
+                break
+
+    if ip is None:
+        return [CheckItem(
+            name="/etc/hosts hostname 映射",
+            expected=f"{hostname} → 非 127.0.0.0/8",
+            current="(hosts 中未配置该 hostname)",
+            ok=False,
+            fix=None,  # 需明确管理 IP, 由运维手工追加
+        )]
+
+    try:
+        octs = [int(x) for x in ip.split(".")]
+    except ValueError:
+        return [CheckItem(
+            name="/etc/hosts hostname 映射",
+            expected="非 127.0.0.0/8",
+            current=f"{hostname} → {ip} (无法解析)",
+            ok=False,
+            fix=None,
+        )]
+    # 127.0.0.0/8 视为本地环回 (排除网络地址 127.0.0.0 与广播 127.255.255.255)
+    in_loopback = (
+        len(octs) == 4 and octs[0] == 127
+        and not (octs[1] == 0 and octs[2] == 0 and octs[3] == 0)
+        and not (octs[1] == 255 and octs[2] == 255 and octs[3] == 255)
+    )
+    return [CheckItem(
+        name="/etc/hosts hostname 映射",
+        expected=f"{hostname} → 非 127.0.0.0/8",
+        current=f"{hostname} → {ip}",
+        ok=not in_loopback,
+        fix=None,
+    )]
+
+
+def check_required_tools() -> List[CheckItem]:
+    """expect / openssl / ifconfig / sshd (含 sftp) 是否可用.
+
+    文档对工具链的依赖:
+      - expect / openssl: 安装 / 升级脚本的子进程调用
+      - ifconfig: 节点 IP / 网卡查询 (高斯部署脚本)
+      - sshd + sftp: 跨节点文件分发
+    """
+    items: List[CheckItem] = []
+    for cmd, probe in (
+        ("expect",   "expect -v"),
+        ("openssl",  "openssl version"),
+        ("ifconfig", "ifconfig -V"),
+    ):
+        rc_which, out_which, _ = run(f"command -v {cmd}")
+        if rc_which != 0 or not out_which.strip():
+            items.append(CheckItem(
+                name=f"{cmd} 命令",
+                expected="存在",
+                current="缺失",
+                ok=False,
+                fix=None,  # 安装命令由运维手工处理 (不同 OS 包名不同)
+            ))
+            continue
+        path = out_which.strip().splitlines()[0]
+        rc_run, _, _ = run(probe)
+        items.append(CheckItem(
+            name=f"{cmd} 命令",
+            expected="可执行",
+            current=("可用 @ " + path if rc_run == 0 else f"@ {path} 但执行失败"),
+            ok=(rc_run == 0),
+            fix=None,
+        ))
+
+    rc, ssh_out, _ = run("systemctl is-active sshd")
+    active = (rc == 0 and "active" in ssh_out)
+    items.append(CheckItem(
+        name="sshd 服务 (含 sftp)",
+        expected="active",
+        current=("active" if active else (ssh_out.strip() or "未运行")),
+        ok=active,
+        fix=None,  # 启动 sshd 可能影响生产防火墙 / 安全策略
+    ))
+    return items
+
+
+def check_profile_echo() -> List[CheckItem]:
+    """检查 /etc/profile 被 source 时是否产生回显——回显会让 OmAgent 拉起失败.
+
+    文档 3.2 现象三: 'OmAgent 服务拉起需要依赖执行环境变量 source /etc/profile,
+    如果执行有回显就会影响服务拉起'.
+    """
+    path = "/etc/profile"
+    if not os.path.exists(path):
+        return [CheckItem(name="/etc/profile source 静默",
+                          expected="无回显",
+                          current="(文件不存在)",
+                          ok=False, fix=None)]
+
+    rc, out, err = run("bash -c 'source /etc/profile'", timeout=30)
+    extra = (out + err).strip()
+    if rc != 0:
+        current = f"语法错误: {(err or out).strip()[:80]}"
+        ok = False
+    elif extra:
+        first = extra.splitlines()[0][:60]
+        current = f"有回显: {first}"
+        ok = False
+    else:
+        current = "无回显"
+        ok = True
+    return [CheckItem(
+        name="/etc/profile source 静默",
+        expected="无回显",
+        current=current,
+        ok=ok,
+        fix=None,  # 修回显需人工逐行检查 profile 内容
+    )]
+
+
 # --------------------------------------------------------------------------- #
 # 主流程
 # --------------------------------------------------------------------------- #
@@ -561,6 +740,9 @@ CHECK_GROUPS: List[Tuple[str, Callable[[], List[CheckItem]]]] = [
     ("网卡 MTU (只读)", check_mtu),
     ("文件句柄 / 进程数", check_limits),
     ("透明大页 / cgroup", lambda: check_thp() + check_cgroup()),
+    ("运行环境", lambda: check_python_version() + check_required_tools()),
+    ("主机名映射", check_hosts),
+    ("profile 静默 (OmAgent 依赖)", check_profile_echo),
 ]
 
 
@@ -701,8 +883,8 @@ def cmd_run() -> int:
             failed.append(f"{it.name}: {e}")
             print(f"  [failed] {it.name}: {e}")
 
-    print("\nTip: limits / HISTSIZE / LANG changes require a new login shell "
-          "or `source /etc/profile` to take effect in the current session.")
+    print("\nTip: limits / LANG / LC_ALL changes take effect only after a new login shell "
+          "or `source /etc/profile` in the current session.")
 
     if failed:
         print("\nFailed items:")
