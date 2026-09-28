@@ -17,12 +17,21 @@ profile、fstab、网卡 MTU 等），不触碰 install_cluster.conf / install_c
 import os
 import platform
 import re
-import shutil
-import socket
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
+
+# --------------------------------------------------------------------------- #
+# 兼容性自检
+# --------------------------------------------------------------------------- #
+
+if sys.version_info < (3, 7):
+    sys.stderr.write(
+        "gaussdb_precheck.py 需要 Python 3.7.9 或更高版本（文档推荐 3.7.9）；"
+        f"当前为 {sys.version.split()[0]}\n"
+    )
+    sys.exit(1)
 
 # --------------------------------------------------------------------------- #
 # 常量 / 推荐值
