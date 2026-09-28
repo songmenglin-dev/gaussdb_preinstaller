@@ -231,9 +231,12 @@ def _set_selinux_permissive(cfg: str = "/etc/selinux/config", content: str = "")
 
 
 def check_charset() -> List[CheckItem]:
-    items: List[CheckItem] = []
+    """只检查 /etc/profile 中的 LANG（必要时 SUSE 额外检查 LC_ALL）。
 
-    # /etc/profile 中的 LANG
+    脚本不修改 /etc/sysconfig/i18n 或 /etc/locale.conf——按文档要求仅在 profile 中
+    维护字符集即可满足安装需求, 避免触发与桌面会话/系统语言环境相关的副作用.
+    """
+    items: List[CheckItem] = []
     profile = read_file("/etc/profile")
     m = re.search(r"^\s*export\s+LANG\s*=\s*(\S+)", profile, re.MULTILINE) if profile else None
     items.append(CheckItem(
@@ -244,7 +247,6 @@ def check_charset() -> List[CheckItem]:
         fix=lambda: _set_profile_lang(profile),
     ))
 
-    # SUSE 额外需要 LC_ALL
     if detect_os() == "suse":
         m2 = re.search(r"^\s*export\s+LC_ALL\s*=\s*(\S+)", profile, re.MULTILINE) if profile else None
         items.append(CheckItem(
@@ -254,18 +256,6 @@ def check_charset() -> List[CheckItem]:
             ok=bool(m2 and m2.group(1) == "en_US.UTF-8"),
             fix=lambda: _set_profile_lcall(profile),
         ))
-
-    # /etc/sysconfig/i18n 或 /etc/locale.conf
-    target = "/etc/sysconfig/i18n" if os.path.exists("/etc/sysconfig/i18n") else "/etc/locale.conf"
-    content = read_file(target)
-    m3 = re.search(r"^\s*(?:export\s+)?LANG\s*=\s*(\S+)", content, re.MULTILINE) if content else None
-    items.append(CheckItem(
-        name=f"{target} LANG",
-        expected="en_US.UTF-8",
-        current=(m3.group(1) if m3 else "(未设置)"),
-        ok=bool(m3 and m3.group(1) == "en_US.UTF-8"),
-        fix=lambda: _set_locale(target, content),
-    ))
     return items
 
 
@@ -295,20 +285,6 @@ def _set_profile_lcall(profile: str, path: str = "/etc/profile") -> None:
     else:
         profile = profile.rstrip() + f"\n{MANAGED_BEGIN}\nexport LC_ALL=en_US.UTF-8\n{MANAGED_END}\n"
     write_file(path, profile)
-
-
-def _set_locale(path: str, content: str) -> None:
-    content = content or ""
-    if re.search(r"^\s*(?:export\s+)?LANG\s*=", content, re.MULTILINE):
-        content = re.sub(
-            r"^\s*(?:export\s+)?LANG\s*=\s*\S+",
-            "LANG=en_US.UTF-8",
-            content,
-            flags=re.MULTILINE,
-        )
-    else:
-        content = content.rstrip() + f"\n{MANAGED_BEGIN}\nLANG=en_US.UTF-8\n{MANAGED_END}\n"
-    write_file(path, content)
 
 
 def check_timezone() -> List[CheckItem]:
@@ -367,12 +343,15 @@ def _comment_swap_fstab(fstab: str, path: str = "/etc/fstab") -> None:
 
 
 def check_mtu() -> List[CheckItem]:
-    """读取 backIp1 绑定的网卡 MTU（默认取第一张非 lo 网卡）。"""
+    """只读检查 backIp1 绑定网卡（默认取第一张非 lo）的 MTU 值。
+
+    脚本不修改 MTU——按文档 1.3.5 节要求 MTU 需与上下游网络设备保持一致, 改错可能
+    导致 SSH/scp 失败, 应由运维人员按现场网络拓扑手工调整. 这里仅做信息展示.
+    """
     rc, out, _ = run("ip -o link show")
     if rc != 0 or not out.strip():
         return [CheckItem(name="网卡 MTU", expected=_mtu_expected(),
-                          current="(无法获取网卡信息)", ok=False,
-                          fix=lambda: None)]
+                          current="(无法获取网卡信息)", ok=False, fix=None)]
     ifaces = []
     for ln in out.splitlines():
         m = re.match(r"\d+:\s+(\S+):", ln)
@@ -380,7 +359,7 @@ def check_mtu() -> List[CheckItem]:
             ifaces.append(m.group(1))
     if not ifaces:
         return [CheckItem(name="网卡 MTU", expected=_mtu_expected(),
-                          current="(未发现网卡)", ok=False, fix=lambda: None)]
+                          current="(未发现网卡)", ok=False, fix=None)]
     primary = ifaces[0]
     rc, out, _ = run(f"ip -o link show {primary}")
     m = re.search(r"mtu\s+(\d+)", out) if rc == 0 else None
@@ -391,16 +370,12 @@ def check_mtu() -> List[CheckItem]:
         expected=expected,
         current=current,
         ok=current == expected,
-        fix=lambda: _set_mtu(primary, expected),
+        fix=None,   # 不自动修改 MTU
     )]
 
 
 def _mtu_expected() -> str:
     return "8192" if get_arch() == "aarch64" else "1500"
-
-
-def _set_mtu(iface: str, mtu: str) -> None:
-    run(f"ip link set dev {iface} mtu {mtu}", check=False)
 
 
 def check_history() -> List[CheckItem]:
@@ -581,7 +556,7 @@ CHECK_GROUPS: List[Tuple[str, Callable[[], List[CheckItem]]]] = [
     ("字符集", check_charset),
     ("时区与时钟源", lambda: check_timezone() + check_clock_service()),
     ("Swap", check_swap),
-    ("网卡 MTU", check_mtu),
+    ("网卡 MTU (只读)", check_mtu),
     ("HISTORY 记录", check_history),
     ("文件句柄 / 进程数", lambda: check_filehandles() + check_nproc()),
     ("透明大页 / cgroup", lambda: check_thp() + check_cgroup()),

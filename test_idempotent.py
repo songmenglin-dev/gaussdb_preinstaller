@@ -58,15 +58,8 @@ def main():
         assert body.count("HISTSIZE=0") == 1, body
     passed.append("_set_hist")
 
-    # 4. _set_locale (path 已经是第一个参数)
-    with tempfile.TemporaryDirectory() as d:
-        target = os.path.join(d, "i18n")
-        for _ in range(3):
-            current = open(target).read() if os.path.exists(target) else ""
-            gpc._set_locale(target, current)
-        body = open(target).read()
-        assert body.count("LANG=en_US.UTF-8") == 1, body
-    passed.append("_set_locale")
+    # 4. /etc/sysconfig/i18n 与 /etc/locale.conf 不再被本脚本修改
+    passed.append("(locale 不再修改, 跳过)")
 
     # 5. _set_selinux_permissive
     with tempfile.TemporaryDirectory() as d:
