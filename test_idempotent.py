@@ -96,14 +96,14 @@ def main():
         assert body.count("* soft nofile 1000000") == 1, body
     passed.append("_strip_root_nofile")
 
-    # 8. _ensure_nproc
+    # 8. _ensure_nproc (新版写 1000000)
     with tempfile.TemporaryDirectory() as d:
         target = os.path.join(d, "90-nproc.conf")
         for _ in range(3):
             current = open(target).read() if os.path.exists(target) else ""
             gpc._ensure_nproc(target, current)
         body = open(target).read()
-        assert body.count("* soft nproc 60000") == 1, body
+        assert body.count("* soft nproc 1000000") == 1, body
     passed.append("_ensure_nproc")
 
     # 9. _comment_swap_fstab
