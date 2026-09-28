@@ -610,7 +610,7 @@ def print_table(items: List[CheckItem]) -> None:
     """Print an aligned table. Column widths are computed in display columns
     (CJK / full-width chars take 2 columns), so the table aligns in any UTF-8 terminal.
     """
-    headers = ("item", "current_values", "expected_value", "status")
+    headers = ("item", "current_value", "expected_value", "status")
     rows = []
     for it in items:
         rows.append((
