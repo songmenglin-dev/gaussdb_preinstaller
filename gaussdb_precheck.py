@@ -126,6 +126,58 @@ def is_service_enabled(name: str) -> bool:
     return rc == 0
 
 
+def _pkg_manager_name() -> str:
+    """返回当前 OS 的包管理器名称 (用于提示), 不执行任何命令."""
+    os_type = detect_os()
+    if os_type in ("kylin", "uos", "hce"):
+        return "yum"
+    if os_type == "suse":
+        return "zypper"
+    # unknown: 探测
+    rc, _, _ = run("command -v yum")
+    if rc == 0:
+        return "yum"
+    rc, _, _ = run("command -v zypper")
+    if rc == 0:
+        return "zypper"
+    return "(未知)"
+
+
+def _pkg_install(pkg: str) -> None:
+    """通过包管理器安装 pkg; 失败抛 RuntimeError(供 cmd_run 捕获并汇总).
+
+    选择顺序: detect_os() → yum/zyyper; unknown → 优先 yum 再 zypper.
+    """
+    os_type = detect_os()
+    cmds: List[str] = []
+    if os_type in ("kylin", "uos", "hce"):
+        cmds.append(f"yum install -y {pkg}")
+    elif os_type == "suse":
+        cmds.append(f"zypper install -y {pkg}")
+    else:
+        rc, _, _ = run("command -v yum")
+        if rc == 0:
+            cmds.append(f"yum install -y {pkg}")
+        rc, _, _ = run("command -v zypper")
+        if rc == 0:
+            cmds.append(f"zypper install -y {pkg}")
+
+    if not cmds:
+        raise RuntimeError(
+            f"未识别到任何包管理器 (yum / zypper); 请手工安装 {pkg}"
+        )
+
+    last_err = "(无输出)"
+    for cmd in cmds:
+        rc, out, err = run(cmd, timeout=300)
+        if rc == 0:
+            return
+        last_err = ((err or out).strip() or "(无输出)")[:300]
+    raise RuntimeError(
+        f"安装 {pkg} 失败 (尝试: {'; '.join(cmds)}): {last_err}"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # 检查项模型
 # --------------------------------------------------------------------------- #
@@ -210,7 +262,7 @@ def check_selinux() -> List[CheckItem]:
     content = read_file(cfg)
     m = re.search(r"^\s*SELINUX\s*=\s*(\w+)", content, re.MULTILINE) if content else None
     current = m.group(1) if m else "(未设置)"
-    ok = current.lower() == "permissive"
+    ok = current.lower() in ("permissive", "disabled")
     items = [CheckItem(
         name="SELINUX 模式",
         expected="permissive",
@@ -587,64 +639,81 @@ def check_python_version() -> List[CheckItem]:
     )]
 
 
-def check_hosts() -> List[CheckItem]:
-    """检查 /etc/hosts 中 hostname 的映射不能落在 127.0.0.0/8.
+def check_python_symlink() -> List[CheckItem]:
+    """检查 `python` 软链是否指向 python3.
 
-    文档 1.3.6: '实例各个节点 /etc/hosts 文件中的 hostname (通过 hostname 命令获取)
-    不能映射到本地环回地址 (127.0.0.1 - 127.255.255.254) 中, 建议映射到管理 IP'.
+    目标:
+      - `python` 不存在  → 创建 /usr/bin/python → /usr/bin/python3
+      - `python` 指向 python2 → 替换为指向 python3
+      - `python` 已指向 python3 → OK
+
+    注: 一些旧脚本会 `import subprocess; subprocess.run("python ...")`,
+    若没有 python 软链接或指向 python2, 部署时会失败.
     """
-    rc, hostname, _ = run("hostname")
-    if rc != 0 or not hostname.strip():
-        return [CheckItem(name="/etc/hosts hostname 映射",
-                          expected="非 127.0.0.0/8",
-                          current="(无法获取 hostname)",
-                          ok=False, fix=None)]
-    hostname = hostname.strip()
-
-    hosts = read_file("/etc/hosts")
-    ip = None
-    if hosts:
-        for ln in hosts.splitlines():
-            s = ln.strip()
-            if not s or s.startswith("#"):
-                continue
-            parts = s.split()
-            if len(parts) >= 2 and hostname in parts[1:]:
-                ip = parts[0]
-                break
-
-    if ip is None:
+    expected = "python → python3"
+    rc, out, _ = run("command -v python")
+    if rc != 0 or not out.strip():
         return [CheckItem(
-            name="/etc/hosts hostname 映射",
-            expected=f"{hostname} → 非 127.0.0.0/8",
-            current="(hosts 中未配置该 hostname)",
+            name="python 软链接",
+            expected=expected,
+            current="(不存在)",
             ok=False,
-            fix=None,  # 需明确管理 IP, 由运维手工追加
+            detail="将创建 /usr/bin/python → /usr/bin/python3 软链",
+            fix=lambda: _ensure_python_symlink(),
         )]
+    py_path = out.strip().splitlines()[0]
 
-    try:
-        octs = [int(x) for x in ip.split(".")]
-    except ValueError:
+    # 解析软链: readlink -f 取最终目标, 再用 python -V 看版本
+    _, target, _ = run(f"readlink -f {py_path}")
+    rc_v, v_out, _ = run("python -V")
+    version = v_out.strip() if rc_v == 0 else "(无法获取版本)"
+    is_py3 = version.startswith("Python 3")
+    if is_py3:
         return [CheckItem(
-            name="/etc/hosts hostname 映射",
-            expected="非 127.0.0.0/8",
-            current=f"{hostname} → {ip} (无法解析)",
-            ok=False,
+            name="python 软链接",
+            expected=expected,
+            current=f"{py_path} → {target} ({version})",
+            ok=True,
             fix=None,
         )]
-    # 127.0.0.0/8 视为本地环回 (排除网络地址 127.0.0.0 与广播 127.255.255.255)
-    in_loopback = (
-        len(octs) == 4 and octs[0] == 127
-        and not (octs[1] == 0 and octs[2] == 0 and octs[3] == 0)
-        and not (octs[1] == 255 and octs[2] == 255 and octs[3] == 255)
-    )
     return [CheckItem(
-        name="/etc/hosts hostname 映射",
-        expected=f"{hostname} → 非 127.0.0.0/8",
-        current=f"{hostname} → {ip}",
-        ok=not in_loopback,
-        fix=None,
+        name="python 软链接",
+        expected=expected,
+        current=f"{py_path} → {target} ({version})",
+        ok=False,
+        detail=f"将删除旧的 python 软链接并重指向 /usr/bin/python3",
+        fix=lambda: _ensure_python_symlink(),
     )]
+
+
+def _ensure_python_symlink() -> None:
+    """确保 /usr/bin/python (或当前 python 路径) 指向 /usr/bin/python3."""
+    py3 = "/usr/bin/python3"
+    if not os.path.exists(py3):
+        raise RuntimeError(
+            f"{py3} 不存在; 无法创建 python 软链接. 请先安装 python3."
+        )
+
+    # 找到现有 python 的位置 (如果存在)
+    rc, out, _ = run("command -v python")
+    if rc == 0 and out.strip():
+        old = out.strip().splitlines()[0]
+        # 只删 /usr/bin 或 /usr/local/bin 下的, 避免删错
+        if old.startswith("/usr/bin/") or old.startswith("/usr/local/bin/"):
+            rrm, orr, oerr = run(f"rm -f {old}")
+            if rrm != 0:
+                raise RuntimeError(f"删除旧链接 {old} 失败: {oerr or orr}")
+        else:
+            raise RuntimeError(
+                f"现有 python 不在 /usr/bin(/local/bin) 下 ({old}), "
+                "为安全起见请手工处理"
+            )
+
+    rc, out, err = run(f"ln -s {py3} /usr/bin/python")
+    if rc != 0:
+        raise RuntimeError(
+            f"ln -s {py3} /usr/bin/python 失败: {(err or out).strip()[:200]}"
+        )
 
 
 def check_required_tools() -> List[CheckItem]:
@@ -654,12 +723,18 @@ def check_required_tools() -> List[CheckItem]:
       - expect / openssl: 安装 / 升级脚本的子进程调用
       - ifconfig: 节点 IP / 网卡查询 (高斯部署脚本)
       - sshd + sftp: 跨节点文件分发
+
+    缺失时尝试通过包管理器自动安装:
+      - kylin / uos / hce → yum install -y <pkg>
+      - suse              → zypper install -y <pkg>
+      - unknown           → 探测 command -v yum / zypper 后再试
     """
     items: List[CheckItem] = []
-    for cmd, probe in (
-        ("expect",   "expect -v"),
-        ("openssl",  "openssl version"),
-        ("ifconfig", "ifconfig -V"),
+    # cmd → 提供命令名的二进制; pkg → 提供该命令的 RPM/deb 包名
+    for cmd, probe, pkg in (
+        ("expect",   "expect -v",     "expect"),
+        ("openssl",  "openssl version", "openssl"),
+        ("ifconfig", "ifconfig -V",   "net-tools"),
     ):
         rc_which, out_which, _ = run(f"command -v {cmd}")
         if rc_which != 0 or not out_which.strip():
@@ -668,7 +743,8 @@ def check_required_tools() -> List[CheckItem]:
                 expected="存在",
                 current="缺失",
                 ok=False,
-                fix=None,  # 安装命令由运维手工处理 (不同 OS 包名不同)
+                detail=f"未安装 {pkg}; 包管理器: " + _pkg_manager_name(),
+                fix=lambda p=pkg: _pkg_install(p),
             ))
             continue
         path = out_which.strip().splitlines()[0]
@@ -740,8 +816,7 @@ CHECK_GROUPS: List[Tuple[str, Callable[[], List[CheckItem]]]] = [
     ("网卡 MTU (只读)", check_mtu),
     ("文件句柄 / 进程数", check_limits),
     ("透明大页 / cgroup", lambda: check_thp() + check_cgroup()),
-    ("运行环境", lambda: check_python_version() + check_required_tools()),
-    ("主机名映射", check_hosts),
+    ("运行环境", lambda: check_python_version() + check_python_symlink() + check_required_tools()),
     ("profile 静默 (OmAgent 依赖)", check_profile_echo),
 ]
 
@@ -867,29 +942,49 @@ def cmd_run() -> int:
 
     blocking = [x for x in not_ok if not x.is_warning]
     warning_items = [x for x in not_ok if x.is_warning]
-    print(f"Fixing {len(blocking)} NOT OK"
-          + (f" and {len(warning_items)} WARNING items ..." if warning_items else " items ...")
-          + "\n")
-    failed: List[str] = []
-    for it in not_ok:
+
+    # WARNING 项目只报告, 不自动修复 —— 例如客户可能故意保留本地时区 (Asia/Shanghai),
+    # 不应被强制改成 UTC; 是否调整由运维按业务决定.
+    if warning_items:
+        print("WARNING items (skipped, manual review required):")
+        for w in warning_items:
+            print(f"  - {w.name}: {w.current}")
+        print()
+
+    if not blocking:
+        print("No blocking items to fix.")
+        return 0
+
+    print(f"Fixing {len(blocking)} NOT OK items ...\n")
+    failed: List[Tuple[str, str]] = []    # (name, error)
+    skipped: List[Tuple[str, str]] = []   # (name, reason)
+    for it in blocking:
         if it.fix is None:
-            print(f"  [skip] {it.name}: no auto-fix (manual required)")
+            reason = it.detail or "no auto-fix (manual required)"
+            skipped.append((it.name, reason))
+            print(f"  [skip] {it.name}: {reason}")
             continue
         try:
             it.fix()
-            tag = "WARNING" if it.is_warning else "NOT OK"
-            print(f"  [fixed][{tag}] {it.name}")
+            print(f"  [fixed] {it.name}")
         except Exception as e:  # noqa: BLE001
-            failed.append(f"{it.name}: {e}")
-            print(f"  [failed] {it.name}: {e}")
+            err_msg = str(e).strip() or repr(e)
+            failed.append((it.name, err_msg))
+            print(f"  [failed] {it.name}: {err_msg}")
 
     print("\nTip: limits / LANG / LC_ALL changes take effect only after a new login shell "
           "or `source /etc/profile` in the current session.")
 
-    if failed:
-        print("\nFailed items:")
-        for f in failed:
-            print("  - " + f)
+    # 集中汇总未自动修复的项目, 暴露具体原因便于运维介入
+    if skipped or failed:
+        print("\n" + "=" * 60)
+        print("未自动修复的项目 (需运维手工处理):")
+        for name, reason in skipped:
+            print(f"  [skip]   {name}")
+            print(f"           原因: {reason}")
+        for name, reason in failed:
+            print(f"  [failed] {name}")
+            print(f"           错误: {reason}")
         return 1
     print("\nAll NOT OK items have been attempted to fix. Run check again to verify.")
     return 0
