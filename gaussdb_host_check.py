@@ -284,7 +284,7 @@ CHECKS: List[CheckDef] = [
              fix_refs=["准备数据盘", "准备系统盘"]),
     CheckDef(100006, "数据盘无分区无挂载", "磁盘", "data_disk_clean",
              expected="无分区无挂载",
-             mandatory=True,
+             mandatory=False,   # 涉及数据销毁风险，fix 不自动处理，仅检查
              fix_refs=["准备数据盘"]),
     CheckDef(100009, "磁盘盘符不混用", "磁盘", "disk_naming",
              expected="不要 sd 和 vd 混用",
