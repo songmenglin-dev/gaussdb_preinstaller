@@ -3,8 +3,8 @@
 """gaussdb_host_check - 主机管理标准化 检查/修复 执行器.
 
 用法:
-    python gaussdb_host_check.py check [--id N]... [--no-color] [--json] [--verbose]
-    python gaussdb_host_check.py fix   [--id N]... [--no-color] [--yes] [--verbose]
+    python gaussdb_host_check.py check [--no-color] [--detail]
+    python gaussdb_host_check.py fix   [--no-color] [--yes]
     python gaussdb_host_check.py list
 
 子命令:
@@ -99,7 +99,6 @@ class Status(Enum):
 _DANGEROUS_PATTERNS = [
     re.compile(r"^\s*rm\s+-r?f?\s+/"),
     re.compile(r"^\s*rm\s+-r?\s+/var"),
-    re.compile(r"^\s*reboot\b"),
     re.compile(r"^\s*shutdown\b"),
     re.compile(r"^\s*poweroff\b"),
     re.compile(r"^\s*init\s+6\b"),
@@ -270,8 +269,8 @@ CHECKS: List[CheckDef] = [
              expected=">= 4",
              value="4"),
     CheckDef(100002, "CPU型号为推荐", "CPU和内存", "cpu_model",
-             expected="Intel Xeon Gold 6248R/5318Y, Hygon 7280, Kunpeng 920",
-             value="Xeon Gold 6248R,Xeon Gold 5318Y,Hygon 7280,Kunpeng 920"),
+             expected="Kunpeng 920, Intel Xeon Gold 6248R/5318Y, Hygon 7280",
+             value="Kunpeng 920,Xeon Gold 6248R,Xeon Gold 5318Y,Hygon 7280"),
     CheckDef(100003, "内存 >= 16G", "CPU和内存", "mem_gb",
              expected=">= 16G",
              value="16"),
@@ -311,12 +310,12 @@ CHECKS: List[CheckDef] = [
              expected="active+enabled",
              key="iptables",
              mandatory=True,
-             fix_refs=["配置操作系统防火墙", "配置系统服务"]),
+             fix_refs=["配置操作系统防火墙", "配置系统服务-iptables"]),
     CheckDef(100061, "cgconfig active & enabled", "系统服务", "service_active",
              expected="active+enabled",
              key="cgconfig",
              mandatory=True,
-             fix_refs=["配置系统服务"]),
+             fix_refs=["配置系统服务-cgconfig"]),
     CheckDef(100013, "firewalld 关闭", "系统服务", "service_inactive",
              expected="inactive",
              key="firewalld",
@@ -326,7 +325,7 @@ CHECKS: List[CheckDef] = [
              expected="active+enabled",
              key="rngd",
              mandatory=True,
-             fix_refs=["配置系统服务"]),
+             fix_refs=["配置系统服务-rngd/haveged"]),
 
     # ===== 时间同步 =====
     CheckDef(100014, "NTP/Chrony 启用 & 同步", "时间同步", "service_active",
@@ -378,10 +377,12 @@ CHECKS: List[CheckDef] = [
     CheckDef(100051, "ulimit -Sn >= 1000000", "文件系统参数", "ulimit_min",
              key="-Sn", value="1000000",
              expected=">= 1000000",
+             mandatory=True,
              fix_refs=["配置文件系统参数"]),
     CheckDef(100052, "ulimit -Hn >= 1000000", "文件系统参数", "ulimit_min",
              key="-Hn", value="1000000",
              expected=">= 1000000",
+             mandatory=True,
              fix_refs=["配置文件系统参数"]),
     CheckDef(100053, "stack size = 3072", "文件系统参数", "ulimit_eq",
              key="stack", value="3072",
@@ -493,9 +494,9 @@ CHECKS: List[CheckDef] = [
              expected="permissive",
              mandatory=True,
              fix_refs=["设置SELinux"]),
-    CheckDef(100087, "python 软链接", "扩展项", "python_link",
+    CheckDef(100087, "python 软链接", "Python3", "python_link",
              expected="python → python3",
-             mandatory=False,
+             mandatory=True,
              fix_refs=["创建Python软链接"]),
 ]
 
@@ -547,15 +548,25 @@ FIX_SECTIONS: Dict[str, Dict] = {
             {"os": None, "cmd": "sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config 2>/dev/null || true"},
         ],
     },
-    "配置系统服务": {
+    "配置系统服务-iptables": {
         "os_filter": None,
         "commands": [
             {"os": None, "cmd": "systemctl start iptables 2>/dev/null || true"},
             {"os": None, "cmd": "systemctl enable iptables 2>/dev/null || true"},
             {"os": None, "cmd": "systemctl unmask iptables 2>/dev/null || true"},
+        ],
+    },
+    "配置系统服务-cgconfig": {
+        "os_filter": None,
+        "commands": [
             {"os": None, "cmd": "systemctl start cgconfig 2>/dev/null || true"},
             {"os": None, "cmd": "systemctl enable cgconfig 2>/dev/null || true"},
             {"os": None, "cmd": "systemctl unmask cgconfig 2>/dev/null || true"},
+        ],
+    },
+    "配置系统服务-rngd/haveged": {
+        "os_filter": None,
+        "commands": [
             {"os": None, "cmd": "systemctl start rngd 2>/dev/null || true"},
             {"os": None, "cmd": "systemctl enable rngd 2>/dev/null || true"},
             {"os": None, "cmd": "systemctl start haveged 2>/dev/null || true"},
@@ -573,9 +584,12 @@ FIX_SECTIONS: Dict[str, Dict] = {
     "设置字符集参数": {
         "os_filter": None,
         "commands": [
-            {"os": None, "cmd": "echo 'export LANG=en_US.UTF-8' >> /etc/profile"},
+            # 幂等：去重已有 LANG 行后写回；不重复追加
+            {"os": None, "cmd": "f=/etc/profile; sed -i '/^[[:space:]]*\\(export[[:space:]]\\+\\)\\{0,1\\}LANG=/d' $f && echo 'export LANG=en_US.UTF-8' >> $f"},
             {"os": None, "cmd": "echo 'LANG=en_US.UTF-8' > /etc/locale.conf 2>/dev/null || true"},
             {"os": None, "cmd": "echo 'LANG=en_US.UTF-8' > /etc/sysconfig/i18n 2>/dev/null || true"},
+            # 验证：source 后无报错且 LANG 取到正确值
+            {"os": None, "cmd": "bash -c 'set -e; source /etc/profile >/dev/null 2>&1; [ \"$LANG\" = \"en_US.UTF-8\" ] && echo OK'"},
         ],
     },
     "设置网卡MTU值": {
@@ -709,8 +723,8 @@ FIX_SECTIONS: Dict[str, Dict] = {
     "创建Python软链接": {
         "os_filter": None,
         "commands": [
-            {"os": None, "cmd": "ln -sf /usr/bin/python3 /usr/bin/python 2>/dev/null || true"},
-            {"os": None, "cmd": "ln -sf /usr/bin/python3 /usr/bin/python3.7 2>/dev/null || true"},
+            # 直接把 python 指向 python3（一层软链，绝不会形成环）
+            {"os": None, "cmd": "ln -sf /usr/bin/python3 /usr/bin/python"},
         ],
     },
 }
@@ -1333,7 +1347,10 @@ def _check_one(c: CheckDef, host: HostInfo) -> CheckResult:
 
         if c.check_type == "locale_utf8":
             lang = _current_lang()
-            ok = "en_US.utf-8" in lang.lower() or "en_us.utf8" in lang.lower()
+            # 大小写、连字符、点号、下划线都视为等价
+            # en_US.UTF-8 == en_us.utf-8 == enusutf8
+            lang_norm = lang.lower().replace("-", "").replace(".", "").replace("_", "")
+            ok = "enusutf8" in lang_norm
             return CheckResult(
                 c.id, c.name,
                 Status.PASS if ok else Status.FAIL,
@@ -1639,14 +1656,61 @@ def _check_one(c: CheckDef, host: HostInfo) -> CheckResult:
                            mandatory=c.mandatory)
 
 
+# 类别显示顺序（数字越小越靠前；未列出的归入"其它"放最后）
+CATEGORY_ORDER = {
+    "CPU和内存":      1,
+    "NUMA分布情况":   2,
+    "系统服务":       3,
+    "时间同步":       4,
+    "磁盘":           6,    # swap 项（按名字匹配，优先级 5）排在它前面
+    "Python3":        7,
+    "expect":         7,
+    "SFTP":           7,
+    "unzip":          7,
+    "软件包管理器":   7,
+}
+DEFAULT_CATEGORY_PRIORITY = 99
+
+
+def _category_priority(c) -> int:
+    """返回 check 的类别显示优先级。
+
+    用户指定的显示顺序：
+      CPU → 内存(RAM) → 系统服务 → swap → 磁盘 → 软件包 → 其它
+    """
+    # swap 相关项放在"系统服务"之后、"磁盘"之前
+    if "swap" in c.name.lower():
+        return 5
+    return CATEGORY_ORDER.get(c.category, DEFAULT_CATEGORY_PRIORITY)
+
+
+def _python3_sub_order(c) -> int:
+    """Python3 类内的子排序：版本正确 → 软链接 → 沿路权限 → 其它。"""
+    n = c.name
+    if "版本" in n:
+        return 0
+    if "软链接" in n:
+        return 1
+    if "沿路权限" in n:
+        return 2
+    return 3
+
+
 def run_all_checks(host: HostInfo, ids: Optional[List[int]] = None) -> List[CheckResult]:
-    """跑所有（或指定 ID 的）check. 强制校验项排在前面."""
+    """跑所有（或指定 ID 的）check. 强制校验项排在前面；同组内按类别 + id 排序."""
     targets = list(CHECKS)
     if ids:
         targets = [c for c in CHECKS if c.id in ids]
-    # 强制分组：所有 Y 项（mandatory=True）排在前，再排所有 n 项；同组内按 id 升序
-    mandatory = sorted([c for c in targets if c.mandatory], key=lambda c: c.id)
-    optional = sorted([c for c in targets if not c.mandatory], key=lambda c: c.id)
+    # 强制分组：所有 Y 项（mandatory=True）排在前，再排所有 n 项；
+    # 同组内按 类别优先级 + 子排序 + id 升序。
+    mandatory = sorted(
+        [c for c in targets if c.mandatory],
+        key=lambda c: (_category_priority(c), _python3_sub_order(c), c.id),
+    )
+    optional = sorted(
+        [c for c in targets if not c.mandatory],
+        key=lambda c: (_category_priority(c), _python3_sub_order(c), c.id),
+    )
     targets = mandatory + optional
     return [_check_one(c, host) for c in targets]
 
@@ -1812,55 +1876,32 @@ def _row_border(widths: List[int]) -> str:
 
 
 def print_check_table(results: List[CheckResult], host: HostInfo,
-                     verbose: bool = False) -> None:
+                     detail: bool = False) -> None:
     """打印检查报告.
 
     布局顺序:
       1) 标题 + 时间 + 环境
-      2) 顶部状态条（总览结论 + 状态计数）
-      3) 详细表格（强制项在前）
-      4) NOT OK 详情（完整信息，便于修复）
-      5) WARNING 列表（精简：单行展示，非 verbose 时只列 item + 当前值）
-      6) 底部汇总（按 强制 / 非强制 分组统计）
+      2) 详细表格（强制项在前）
+      3) 底部汇总（总览结论 + 状态计数 + 强制/非强制分组，数字上下对齐）
+      4) NOT OK 详情（仅 --detail 时输出）
+      5) WARNING 详情（仅 --detail 时输出）
     """
     # ---------- 1. 标题 ----------
+    # 标签按视觉宽度对齐（CJK=2，ASCII=1），让冒号上下对齐且每行标签后至少 1 个空格
+    def _pad_label(s: str, width: int) -> str:
+        return s + " " * (width - _vwidth(s))
+    label_w = max(_vwidth(s) for s in ("时间", "操作系统", "权限")) + 1
     print(f"\n{C_BOLD}主机标准化检查报告{C_RESET}")
-    print(f"  时间    : {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  操作系统  : {C_CYAN}{host.os_id} {host.os_version}{C_RESET}")
-    print(f"  权限    : {C_CYAN}root={host.is_root}{C_RESET}")
+    print(f"  {_pad_label('时间', label_w)}: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  {_pad_label('操作系统', label_w)}: {C_CYAN}{host.os_id} {host.os_version}{C_RESET}")
+    print(f"  {_pad_label('权限', label_w)}: {C_CYAN}root={host.is_root}{C_RESET}")
 
-    # ---------- 2. 顶部状态条 ----------
-    ok_n = sum(1 for r in results if r.status == Status.PASS)
-    not_ok_n = sum(1 for r in results if r.status == Status.FAIL and r.mandatory)
-    warn_n = sum(1 for r in results if r.status == Status.FAIL and not r.mandatory)
-    err_n = sum(1 for r in results if r.status == Status.ERROR)
-    total = len(results)
-
-    if not_ok_n > 0:
-        verdict = f"{C_RED}{C_BOLD}存在 {not_ok_n} 项强制项不达标，必须修复后才能安装 GaussDB{C_RESET}"
-    elif err_n > 0:
-        verdict = f"{C_MAGENTA}{C_BOLD}存在 {err_n} 项检查异常，请人工排查{C_RESET}"
-    elif warn_n > 0:
-        verdict = f"{C_YELLOW}{C_BOLD}强制项已通过，但有 {warn_n} 项非强制项建议修复{C_RESET}"
-    else:
-        verdict = f"{C_GREEN}{C_BOLD}全部通过{C_RESET}"
-
-    bar = "═" * 64
-    print(f"\n{C_DIM}{bar}{C_RESET}")
-    print(f"  {verdict}")
-    print(f"  共 {C_BOLD}{total}{C_RESET} 项   "
-          f"{C_GREEN}OK={ok_n}{C_RESET}   "
-          f"{C_RED}{C_BOLD}NOT OK={not_ok_n}{C_RESET}   "
-          f"{C_YELLOW}WARNING={warn_n}{C_RESET}   "
-          f"{C_MAGENTA}ERROR={err_n}{C_RESET}")
-    print(f"{C_DIM}{bar}{C_RESET}\n")
-
-    # ---------- 3. 详细表格 ----------
+    # ---------- 2. 详细表格 ----------
     # 固定列宽：item 优先，current/expected 给足
     headers = ["#", "item", "current_value", "expected_value", "M", "status"]
-    widths = [4, 30, 26, 22, 2, 8]   # M 列只放 1 字符的 Y/n
+    widths = [4, 30, 41, 52, 2, 8]   # M 列只放 1 字符的 Y/n
     # 终端太窄时压缩 current/expected
-    term_w = shutil.get_terminal_size((140, 40)).columns
+    term_w = shutil.get_terminal_size((160, 40)).columns
     total_w = sum(widths) + 7 * 2  # 每列两侧 " | " 加首尾 "| "
     if total_w > term_w:
         overflow = total_w - term_w
@@ -1897,8 +1938,39 @@ def print_check_table(results: List[CheckResult], host: HostInfo,
             (not_ok if r.mandatory else warning).append(r)
     print(_row_border(widths))
 
-    # ---------- 4. NOT OK 详情（完整） ----------
-    if not_ok:
+    # ---------- 3. 底部汇总（数字上下对齐） ----------
+    ok_n = sum(1 for r in results if r.status == Status.PASS)
+    not_ok_n = len(not_ok)
+    warn_n = len(warning)
+    err_n = sum(1 for r in results if r.status == Status.ERROR)
+    total = len(results)
+    # 数字按宽度对齐（按最大项数 4 位 + label 对齐）
+    # 模板：OK=<N>  NOT OK=<N>  WARNING=<N>  ERROR=<N>
+    num_w = max(len(str(max(ok_n, not_ok_n, warn_n, err_n, total))), 2)
+
+    if not_ok_n > 0:
+        verdict = f"{C_RED}{C_BOLD}存在 {not_ok_n} 项强制项不达标，必须修复后才能安装 GaussDB{C_RESET}"
+    elif err_n > 0:
+        verdict = f"{C_MAGENTA}{C_BOLD}存在 {err_n} 项检查异常，请人工排查{C_RESET}"
+    elif warn_n > 0:
+        verdict = f"{C_YELLOW}{C_BOLD}强制项已通过，但有 {warn_n} 项非强制项建议修复{C_RESET}"
+    else:
+        verdict = f"{C_GREEN}{C_BOLD}全部通过{C_RESET}"
+
+    bar = "═" * 64
+    print(f"\n{C_DIM}{bar}{C_RESET}")
+    print(f"  {verdict}")
+    # 4 个数字用同一 num_w 宽度对齐
+    print(f"  共 {C_BOLD}{total:>{num_w}}{C_RESET} 项    "
+          f"{C_GREEN}OK={ok_n:>{num_w}}{C_RESET}    "
+          f"{C_RED}{C_BOLD}NOT OK={not_ok_n:>{num_w}}{C_RESET}    "
+          f"{C_YELLOW}WARNING={warn_n:>{num_w}}{C_RESET}    "
+          f"{C_MAGENTA}ERROR={err_n:>{num_w}}{C_RESET}")
+    # 末尾只保留：verdict + 总数统计（按用户要求，不显示分类统计）
+    print(f"{C_DIM}{bar}{C_RESET}")
+
+    # ---------- 4. NOT OK 详情（仅 --detail 时输出） ----------
+    if detail and not_ok:
         print(f"\n{C_RED}{C_BOLD}=== NOT OK（强制项不达标，必须修复）[{len(not_ok)} 项] ==={C_RESET}")
         for r in not_ok:
             print(f"  {C_BOLD}{r.display_item}{C_RESET}")
@@ -1908,8 +1980,8 @@ def print_check_table(results: List[CheckResult], host: HostInfo,
             if r.fix_refs:
                 print(f"      fix     : {', '.join(r.fix_refs)}")
 
-    # ---------- 5. WARNING 列表（默认不输出，仅 --verbose 时显示） ----------
-    if warning and verbose:
+    # ---------- 5. WARNING 详情（仅 --detail 时输出） ----------
+    if detail and warning:
         print(f"\n{C_YELLOW}{C_BOLD}=== WARNING（非强制项不达标，建议修复）[{len(warning)} 项] ==={C_RESET}")
         for r in warning:
             print(f"  {C_BOLD}{r.display_item}{C_RESET}")
@@ -1917,28 +1989,6 @@ def print_check_table(results: List[CheckResult], host: HostInfo,
             print(f"      expected: {r.display_expected}")
             if r.fix_refs:
                 print(f"      fix     : {', '.join(r.fix_refs)}")
-
-    # ---------- 6. 底部汇总（按 强制 / 非强制 分组） ----------
-    mand = [r for r in results if r.mandatory]
-    optional = [r for r in results if not r.mandatory]
-    m_pass = sum(1 for r in mand if r.status == Status.PASS)
-    m_fail = sum(1 for r in mand if r.status == Status.FAIL)
-    m_err = sum(1 for r in mand if r.status == Status.ERROR)
-    o_pass = sum(1 for r in optional if r.status == Status.PASS)
-    o_fail = sum(1 for r in optional if r.status == Status.FAIL)
-    o_err = sum(1 for r in optional if r.status == Status.ERROR)
-
-    print(f"\n{C_DIM}{'─' * 64}{C_RESET}")
-    print(f"{C_BOLD}分类统计{C_RESET}")
-    print(f"  强制项   ({len(mand):>2} 项):  "
-          f"{C_GREEN}OK={m_pass}{C_RESET}   "
-          f"{C_RED}{C_BOLD}NOT OK={m_fail}{C_RESET}   "
-          f"{C_MAGENTA}ERROR={m_err}{C_RESET}")
-    print(f"  非强制项 ({len(optional):>2} 项):  "
-          f"{C_GREEN}OK={o_pass}{C_RESET}   "
-          f"{C_YELLOW}WARNING={o_fail}{C_RESET}   "
-          f"{C_MAGENTA}ERROR={o_err}{C_RESET}")
-    print(f"{C_DIM}{'─' * 64}{C_RESET}")
 
 
 def print_fix_report(steps: List[FixStep]) -> int:
@@ -1974,30 +2024,46 @@ def print_fix_report(steps: List[FixStep]) -> int:
 # =============================================================
 
 def cmd_list() -> int:
-    print(f"{C_BOLD}共 {len(CHECKS)} 项检查{C_RESET}")
-    print(f"  {'ID':<7} {'Category':<14} {'Name':<48} {'Type':<16} Mandatory")
-    print(f"  {'-'*7} {'-'*14} {'-'*48} {'-'*16} {'-'*9}")
-    for c in CHECKS:
-        mand = "Y" if c.mandatory else "n"
-        print(f"  {c.id:<7} {c.category:<14} {_truncate(c.name, 47):<48} {c.check_type:<16} {mand}")
+    print(f"\n{C_BOLD}主机标准化检查项清单{C_RESET}  共 {len(CHECKS)} 项\n")
+    # 与 check 表格相同的列宽与对齐策略（视觉宽度，CJK=2）
+    headers = ["ID", "Category", "Name", "Type", "M"]
+    widths = [7, 14, 44, 16, 2]
+    term_w = shutil.get_terminal_size((140, 40)).columns
+    total_w = sum(widths) + 6 * 2  # 5 列 + 5 个 " | " + 首尾 "| "
+    if total_w > term_w and widths[2] > 20:
+        widths[2] -= min(total_w - term_w, widths[2] - 20)
+
+    print(_row_border(widths))
+    print("| " + " | ".join(_cell(h, w) for h, w in zip(headers, widths)) + " |")
+    print(_row_border(widths))
+    # 与 check 完全一致的顺序：强制项在前 → 组内按 (类别优先级, Python3 子序, id)
+    mandatory = sorted(
+        [c for c in CHECKS if c.mandatory],
+        key=lambda c: (_category_priority(c), _python3_sub_order(c), c.id),
+    )
+    optional = sorted(
+        [c for c in CHECKS if not c.mandatory],
+        key=lambda c: (_category_priority(c), _python3_sub_order(c), c.id),
+    )
+    sorted_checks = mandatory + optional
+    for c in sorted_checks:
+        mand_colored = (f"{C_RED}{C_BOLD}Y{C_RESET}" if c.mandatory
+                        else f"{C_DIM}n{C_RESET}")
+        print("| " + " | ".join([
+            _cell(str(c.id), widths[0], align=">"),
+            _cell(c.category, widths[1]),
+            _cell(_truncate(c.name, widths[2] - 1), widths[2]),
+            _cell(c.check_type, widths[3]),
+            _cell(mand_colored, widths[4]),
+        ]) + " |")
+    print(_row_border(widths))
     return 0
 
 
 def cmd_check(args: argparse.Namespace) -> int:
     host = detect_host()
-    ids = args.ids if args.ids else None
-    results = run_all_checks(host, ids)
-    if args.json:
-        import json as _json
-        print(_json.dumps([{
-            "id": r.id, "name": r.name, "status": r.status.value,
-            "severity": r.severity_label,
-            "mandatory": r.mandatory,
-            "current": r.current, "expected": r.expected,
-            "message": r.message, "fix_refs": r.fix_refs,
-        } for r in results], ensure_ascii=False, indent=2))
-    else:
-        print_check_table(results, host, verbose=getattr(args, "verbose", False))
+    results = run_all_checks(host)
+    print_check_table(results, host, detail=getattr(args, "detail", False))
     not_ok = sum(1 for r in results if r.status == Status.FAIL and r.mandatory)
     return 2 if not_ok else (0 if not any(r.status == Status.FAIL for r in results) else 1)
 
@@ -2007,15 +2073,25 @@ def cmd_fix(args: argparse.Namespace) -> int:
     if not host.is_root:
         print(f"{C_RED}ERROR: fix 子命令需要 root 权限 (current euid={os.geteuid()}){C_RESET}")
         return 3
-    ids = args.ids if args.ids else None
-    results = run_all_checks(host, ids)
-    fails = [r for r in results if r.status == Status.FAIL]
-    if not fails:
-        print(f"{C_GREEN}所有 check 项都已 PASS，无需 fix。{C_RESET}")
-        return 0
-    not_ok_n = sum(1 for r in fails if r.mandatory)
-    warn_n = len(fails) - not_ok_n
-    print(f"{C_YELLOW}有 {not_ok_n} 项 NOT OK（强制）+ {warn_n} 项 WARNING（非强制），开始执行修复...{C_RESET}\n")
+    results = run_all_checks(host)
+    all_fails = [r for r in results if r.status == Status.FAIL]
+    not_ok_n = sum(1 for r in all_fails if r.mandatory)
+    warn_n = len(all_fails) - not_ok_n
+    # 默认只修 NOT OK（强制 FAIL）；加 --all 才一并修 WARNING
+    if getattr(args, "all", False):
+        fails = all_fails
+        if warn_n:
+            print(f"{C_YELLOW}有 {not_ok_n} 项 NOT OK + {warn_n} 项 WARNING（--all 模式全部修复），开始执行修复...{C_RESET}\n")
+        else:
+            print(f"{C_YELLOW}有 {not_ok_n} 项 NOT OK，开始执行修复...{C_RESET}\n")
+    else:
+        fails = [r for r in all_fails if r.mandatory]
+        if warn_n:
+            print(f"{C_DIM}另有 {warn_n} 项 WARNING（非强制）跳过修复；如需一并修复请加 --all / -A{C_RESET}")
+        if not fails:
+            print(f"{C_GREEN}没有 NOT OK 项需要修复。{C_RESET}")
+            return 0
+        print(f"{C_YELLOW}有 {not_ok_n} 项 NOT OK（强制），开始执行修复...{C_RESET}\n")
     steps = run_fix(fails, host, assume_yes=args.yes)
     failed = print_fix_report(steps)
     if failed:
@@ -2023,7 +2099,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
         return 2
     # 重新跑一遍检查
     print(f"\n{C_BOLD}重新跑一遍 check 验证...{C_RESET}")
-    new_results = run_all_checks(host, ids)
+    new_results = run_all_checks(host)
     print_check_table(new_results, host)
     new_not_ok = sum(1 for r in new_results if r.status == Status.FAIL and r.mandatory)
     new_warn = sum(1 for r in new_results if r.status == Status.FAIL and not r.mandatory)
@@ -2042,27 +2118,41 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(
         prog="gaussdb_host_check",
         description="主机管理标准化 检查/修复 执行器",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    # 让顶层 --help 同时展示三个子命令的完整参数
     p.add_argument("--no-color", action="store_true", help="禁用 ANSI 颜色")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_check = sub.add_parser("check", help="运行所有检查并打印报告")
-    p_check.add_argument("--id", type=int, action="append", dest="ids",
-                         help="仅检查指定 ID（可多次）")
-    p_check.add_argument("--json", action="store_true", help="JSON 输出")
-    p_check.add_argument("--verbose", "-v", action="store_true",
-                         help="同时显示非强制 WARNING 项的详情（默认仅显示 NOT OK）")
+    p_check.add_argument("--detail", "-d", action="store_true",
+                         help="显示 NOT OK 和 WARNING 项的详情（默认不输出）")
     p_check.set_defaults(func=cmd_check)
 
-    p_fix = sub.add_parser("fix", help="对 FAIL 项执行修复命令")
-    p_fix.add_argument("--id", type=int, action="append", dest="ids",
-                       help="仅修复指定 ID（可多次）")
+    p_fix = sub.add_parser("fix", help="对 NOT OK 项执行修复命令")
     p_fix.add_argument("--yes", action="store_true",
-                       help="允许执行危险命令（rm -r / reboot 等）")
+                       help="允许执行危险命令（默认拒绝 rm -r / 磁盘操作等）")
+    p_fix.add_argument("--all", "-A", "-a", action="store_true", dest="all",
+                       help="一并修复 WARNING（非强制）项，默认只修 NOT OK")
     p_fix.set_defaults(func=cmd_fix)
 
     p_list = sub.add_parser("list", help="列出所有检查项")
     p_list.set_defaults(func=lambda a: cmd_list())
+
+    # 自定义 help：打印顶层 + 三个子命令完整用法
+    class _AllHelpAction(argparse.Action):
+        def __init__(self, option_strings, dest, **kwargs):
+            super().__init__(option_strings, dest, nargs=0, **kwargs)
+        def __call__(self, parser, namespace, values, option_string=None):
+            p.print_help()
+            for name, sp in (("check", p_check), ("fix", p_fix), ("list", p_list)):
+                print(f"\n子命令 `{name}` 的参数：")
+                sp.print_help()
+            parser.exit()
+    for action in p._actions:
+        if action.dest == "help":
+            action.__class__ = _AllHelpAction
+            break
 
     args = p.parse_args(argv)
     if args.no_color:
