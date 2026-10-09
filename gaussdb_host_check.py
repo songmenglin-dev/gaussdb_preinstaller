@@ -288,21 +288,21 @@ CHECKS: List[CheckDef] = [
              fix_refs=["准备数据盘"]),
     CheckDef(100009, "磁盘盘符不混用", "磁盘", "disk_naming",
              expected="不要 sd 和 vd 混用",
-             mandatory=True,
+             mandatory=False,   # 无对应 fix 命令，仅检查
              fix_refs=["准备数据盘", "准备系统盘"]),
     CheckDef(100069, "系统盘非多磁盘", "磁盘", "sysdisk_single",
              expected="单盘",
-             mandatory=True,
+             mandatory=False,   # 需重装或选 DM 模式，仅检查
              fix_refs=["准备系统盘"]),
     CheckDef(100070, "系统盘非 NVMe", "磁盘", "sysdisk_not_nvme",
              expected="SAS/SATA SSD",
-             mandatory=True,
+             mandatory=False,   # 硬件层面要求，仅检查
              fix_refs=["准备系统盘"]),
 
     # ===== 操作系统版本 =====
     CheckDef(100011, "OS 版本受支持", "操作系统版本", "os_supported",
              expected="麒麟V10 SP1-3 / 统信V20 / HCE 2.0 / SUSE 12 SP5 / BCLINUX 21.10",
-             mandatory=True,
+             mandatory=False,   # 需重装 OS，fix 无法处理，仅检查
              fix_refs=["准备系统盘"]),
 
     # ===== 系统服务 =====
@@ -395,7 +395,7 @@ CHECKS: List[CheckDef] = [
              fix_refs=["安装Expect"]),
     CheckDef(100056, "sftp 可用", "SFTP", "sftp",
              expected="available",
-             mandatory=True,
+             mandatory=False,   # 依赖 openssh-clients 包，无对应 fix 命令，仅检查
              fix_refs=[]),
     CheckDef(100010, "unzip 已安装", "unzip", "pkg",
              key="unzip", expected="installed",
