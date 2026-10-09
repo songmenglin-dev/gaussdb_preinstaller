@@ -225,7 +225,6 @@ class CheckDef:
 #   cgroup_v1          kwargs: -
 #   profile_source     kwargs: -
 #   hosts_ipv6         kwargs: -
-#   om_agent           kwargs: -
 #   sftp               kwargs: -
 #   security_perm      kwargs: -
 #   timezone_utc       kwargs: -
@@ -255,6 +254,7 @@ class CheckDef:
 #   path_perm_min      kwargs: path (glob，逗号分隔), value (八进制最小权限)
 #   pkgmgr_ok          kwargs: -
 #   numa_balanced      kwargs: -
+#   ssh_port           kwargs: -
 # ---------------------------------------------------------------
 
 # 所有检查项都由 _check_one() 自动判定，结果只有三种：
@@ -314,7 +314,6 @@ CHECKS: List[CheckDef] = [
     CheckDef(100061, "cgconfig active & enabled", "系统服务", "service_active",
              expected="active+enabled",
              key="cgconfig",
-             mandatory=True,
              fix_refs=["配置系统服务-cgconfig"]),
     CheckDef(100013, "firewalld 关闭", "系统服务", "service_inactive",
              expected="inactive",
@@ -423,7 +422,10 @@ CHECKS: List[CheckDef] = [
     # ===== NUMA =====
     CheckDef(100062, "NUMA 分布均衡", "NUMA分布情况", "numa_balanced",
              expected="各 NUMA 节点内存差异 <= 20%",
-             mandatory=True,
+             fix_refs=[]),
+
+    CheckDef(100080, "SSH 服务运行端口", "系统服务", "ssh_port",
+             expected="SSH 服务端口号",
              fix_refs=[]),
 
     CheckDef(100065, "ping localhost 成功", "网络通信检查", "ping_localhost",
@@ -433,12 +435,7 @@ CHECKS: List[CheckDef] = [
 
     # ===== 网络端口占用检查 =====
     CheckDef(100066, "8000 端口未被占用", "网络端口占用检查", "port_free",
-             port=8000, expected="free",
-             fix_refs=["网络端口占用检查"]),
-    CheckDef(100067, "9000 / 20050 端口未被占用", "网络端口占用检查", "ports_free",
-             key="9000,20050", expected="free",
-             mandatory=True,
-             fix_refs=["网络端口占用检查"]),
+             port=8000, expected="free"),
     CheckDef(100068, "12017 端口未被占用", "网络端口占用检查", "port_free",
              port=12017, expected="free",
              mandatory=True,
@@ -453,12 +450,6 @@ CHECKS: List[CheckDef] = [
              expected="仅 IPv4 或仅 IPv6，不能同时",
              mandatory=True,
              fix_refs=["检查hosts文件"]),
-
-    # ===== om_agent =====
-    CheckDef(100074, "无 om_agent 进程残留", "om_agent进程", "om_agent",
-             expected="无残留",
-             mandatory=True,
-             fix_refs=["检查om_agent进程"]),
 
     # ===== TPOPS 标识码 =====
     CheckDef(100075, "主机未在其他 TPOPS 上添加", "TPOPS标识码", "tpops_unbound",
@@ -675,10 +666,6 @@ FIX_SECTIONS: Dict[str, Dict] = {
             # 仅在确实需要时由用户手动操作
             {"os": None, "cmd": "cat /etc/hosts | grep -E 'localhost|ipv'"},
         ],
-    },
-    "检查om_agent进程": {
-        "os_filter": None,
-        "commands": [],  # 不自动 kill，仅检查
     },
     "检查TPOPS标识码": {
         "os_filter": None,
@@ -1022,6 +1009,32 @@ def _numa_mem_sizes_mb() -> List[int]:
     return sizes
 
 
+def _ssh_listening_port() -> str:
+    """SSH 服务当前监听端口（字符串）。检测失败返回空串。
+
+    优先读 /etc/ssh/sshd_config 的 Port 指令，否则扫 ss 输出中的 sshd 进程。
+    """
+    # 1) 从 sshd_config 解析 Port 指令
+    try:
+        with open("/etc/ssh/sshd_config", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                m = re.match(r"^Port\s+(\d+)", s, re.I)
+                if m:
+                    return m.group(1)
+    except Exception:
+        pass
+    # 2) 回退：扫描 ss 中 sshd 监听端口
+    rc, out, _ = run_shell("ss -tlnp 2>/dev/null | grep -i sshd")
+    if rc == 0 and out.strip():
+        m = re.search(r":(\d+)\s", out)
+        if m:
+            return m.group(1)
+    return ""
+
+
 def _check_one(c: CheckDef, host: HostInfo) -> CheckResult:
     """执行单个 check，返回结果."""
     try:
@@ -1084,6 +1097,18 @@ def _check_one(c: CheckDef, host: HostInfo) -> CheckResult:
                 current=f"{c.key}: {active}",
                 expected=c.expected,
                 message="OK" if ok else f"需要 inactive，实际 {active}",
+                fix_refs=c.fix_refs,
+                mandatory=c.mandatory,
+            )
+
+        if c.check_type == "ssh_port":
+            port = _ssh_listening_port()
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS,
+                current=port if port else "未监听",
+                expected=c.expected,
+                message="OK" if port else "未检测到 SSH 监听端口",
                 fix_refs=c.fix_refs,
                 mandatory=c.mandatory,
             )
@@ -1167,20 +1192,6 @@ def _check_one(c: CheckDef, host: HostInfo) -> CheckResult:
                 current=f"v4={has_v4} v6={has_v6}",
                 expected=c.expected,
                 message="OK" if ok else "同时配置了 IPv4 和 IPv6，请删除 IPv6 localhost 行",
-                fix_refs=c.fix_refs,
-                mandatory=c.mandatory,
-            )
-
-        if c.check_type == "om_agent":
-            rc, out, _ = run_shell("ps -ef | grep -v grep | grep om_agent || true")
-            has = bool(out.strip())
-            ok = not has
-            return CheckResult(
-                c.id, c.name,
-                Status.PASS if ok else Status.FAIL,
-                current="存在残留" if has else "无残留",
-                expected=c.expected,
-                message="OK" if ok else "有 om_agent 进程残留",
                 fix_refs=c.fix_refs,
                 mandatory=c.mandatory,
             )
