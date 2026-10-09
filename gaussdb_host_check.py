@@ -45,33 +45,49 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 # ANSI 颜色
 USE_COLOR = True
 
+C_RESET = ""
+C_BOLD = ""
+C_DIM = ""
+C_RED = ""
+C_GREEN = ""
+C_YELLOW = ""
+C_BLUE = ""
+C_MAGENTA = ""
+C_CYAN = ""
+
 
 def _ansi(code: str) -> str:
     return f"\033[{code}m" if USE_COLOR else ""
 
 
-C_RESET = _ansi("0")
-C_BOLD = _ansi("1")
-C_DIM = _ansi("2")
-C_RED = _ansi("31")
-C_GREEN = _ansi("32")
-C_YELLOW = _ansi("33")
-C_BLUE = _ansi("34")
-C_MAGENTA = _ansi("35")
-C_CYAN = _ansi("36")
+def set_color(enabled: bool) -> None:
+    """开关 ANSI 颜色。C_* 常量在导入时已生成，切换时需一并重建。"""
+    global USE_COLOR, C_RESET, C_BOLD, C_DIM, C_RED, C_GREEN, C_YELLOW
+    global C_BLUE, C_MAGENTA, C_CYAN
+    USE_COLOR = enabled
+    C_RESET = _ansi("0")
+    C_BOLD = _ansi("1")
+    C_DIM = _ansi("2")
+    C_RED = _ansi("31")
+    C_GREEN = _ansi("32")
+    C_YELLOW = _ansi("33")
+    C_BLUE = _ansi("34")
+    C_MAGENTA = _ansi("35")
+    C_CYAN = _ansi("36")
+
+
+set_color(True)
 
 
 class Status(Enum):
     PASS = "PASS"
     FAIL = "FAIL"
-    SKIP = "SKIP"
     ERROR = "ERROR"
 
     def color(self) -> str:
         return {
             Status.PASS: C_GREEN,
             Status.FAIL: C_RED,
-            Status.SKIP: C_YELLOW,
             Status.ERROR: C_MAGENTA,
         }[self]
 
@@ -112,7 +128,7 @@ def is_dangerous(cmd: str) -> bool:
 
 
 # =============================================================
-# 操作系统/容器/权限 探测
+# 操作系统/权限 探测
 # =============================================================
 
 @dataclass
@@ -120,33 +136,31 @@ class HostInfo:
     os_id: str = "unknown"           # kylin / uos / hce / sle / bclinux / unknown
     os_version: str = ""
     is_root: bool = False
-    is_container: bool = False
     package_manager: str = ""        # yum / dnf / zypper / apt
+
+
+def _read_os_release() -> Dict[str, str]:
+    """解析 /etc/os-release，返回 KEY -> VALUE（值已去引号）。"""
+    data: Dict[str, str] = {}
+    if not os.path.exists("/etc/os-release"):
+        return data
+    try:
+        for line in open("/etc/os-release", encoding="utf-8", errors="ignore"):
+            if "=" in line and not line.strip().startswith("#"):
+                k, v = line.split("=", 1)
+                data[k.strip()] = v.strip().strip('"')
+    except Exception:
+        pass
+    return data
 
 
 def detect_host() -> HostInfo:
     info = HostInfo()
     info.is_root = (os.geteuid() == 0)
-    # container
-    info.is_container = (
-        os.path.exists("/.dockerenv")
-        or os.path.exists("/run/.containerenv")
-        or (os.path.exists("/proc/1/cgroup")
-            and any(x in open("/proc/1/cgroup", errors="ignore").read()
-                    for x in ("docker", "containerd", "kubepods")))
-    )
     # os
-    if os.path.exists("/etc/os-release"):
-        try:
-            data = {}
-            for line in open("/etc/os-release", encoding="utf-8", errors="ignore"):
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    data[k.strip()] = v.strip().strip('"')
-            info.os_id = data.get("ID", "unknown").lower()
-            info.os_version = data.get("VERSION_ID", "")
-        except Exception:
-            pass
+    data = _read_os_release()
+    info.os_id = data.get("ID", "unknown").lower()
+    info.os_version = data.get("VERSION_ID", "")
     # package manager
     for pm, path in (("yum", "/usr/bin/yum"), ("dnf", "/usr/bin/dnf"),
                      ("zypper", "/usr/bin/zypper"), ("apt", "/usr/bin/apt")):
@@ -191,101 +205,104 @@ class CheckDef:
     expected: str = ""             # 期望值（人读）
     fix_refs: List[str] = field(default_factory=list)
     # type-specific fields:
-    key: str = ""                  # sysctl key / ulimit type / service / package / port
+    key: str = ""                  # ulimit type / service / package / port
     port: int = 0
     path: str = ""
     value: str = ""
-    cmd: str = ""                  # raw command for show-output
     mandatory: bool = False
-    container_check: bool = True
-
-
-def _sysctl_value(key: str) -> str:
-    rc, out, _ = run_shell(f"sysctl -n {key} 2>/dev/null")
-    return out.strip() if rc == 0 else ""
-
-
-def _sysctl_eq(key: str, value: str) -> bool:
-    return _sysctl_value(key) == value
 
 
 # ---------------------------------------------------------------
-# CHECKS 数据（74 项）
+# CHECKS 数据
 # 字段格式: (id, name, type, expected, fix_ref, **kwargs)
 # type:
-#   sysctl_eq      kwargs: key, value
-#   ulimit         kwargs: key (-Sn/-Hn/-s), value
-#   service_active kwargs: name
-#   service_inactive kwargs: name
-#   service_enabled kwargs: name
-#   pkg            kwargs: name
-#   port_in_use    kwargs: port  (PASS when port is in use, FAIL when free)
-#   port_free      kwargs: port  (PASS when port is free, FAIL when in use)
-#   cgroup_v1      kwargs: -
-#   cpu_cores      kwargs: value
-#   mem_gb         kwargs: value
-#   path_perm      kwargs: path, value (octal string like "755")
-#   path_exists    kwargs: path
-#   hosts_ipv6     kwargs: -
-#   python_version kwargs: name (麒麟/统信/HCE/SUSE/BCLINUX -> 期望版本)
-#   expect         kwargs: -
-#   sftp           kwargs: -
-#   profile_source kwargs: -
-#   om_agent       kwargs: -
-#   hosts_unique   kwargs: -
-#   security_perm  kwargs: -
-#   show           kwargs: cmd  (run cmd, just display stdout, expect user judgement)
+#   ulimit_min         kwargs: key (-Sn/-Hn), value
+#   ulimit_eq          kwargs: key (-s), value
+#   service_active     kwargs: key (服务名)
+#   service_inactive   kwargs: key (服务名)
+#   pkg                kwargs: key (包名)
+#   port_free          kwargs: port
+#   ports_free         kwargs: key (逗号分隔端口)
+#   cgroup_v1          kwargs: -
+#   profile_source     kwargs: -
+#   hosts_ipv6         kwargs: -
+#   om_agent           kwargs: -
+#   sftp               kwargs: -
+#   security_perm      kwargs: -
+#   timezone_utc       kwargs: -
+#   swap_active        kwargs: -
+#   swap_fstab         kwargs: -
+#   thp_never          kwargs: -
+#   selinux_mode       kwargs: -
+#   python_link        kwargs: -
+#   cpu_cores          kwargs: value (最小核数)
+#   cpu_model          kwargs: value (推荐型号关键字，逗号分隔)
+#   mem_gb             kwargs: value (最小内存 GB)
+#   cpu_mem_ratio      kwargs: value (允许的 内存/核数，逗号分隔)
+#   disk_rotational    kwargs: -
+#   data_disk_clean    kwargs: -
+#   disk_naming        kwargs: -
+#   sysdisk_single     kwargs: -
+#   sysdisk_not_nvme   kwargs: -
+#   os_supported       kwargs: -
+#   locale_utf8        kwargs: -
+#   mtu_ok             kwargs: value (允许的 MTU，逗号分隔)
+#   histsize_zero      kwargs: -
+#   dir_empty          kwargs: path
+#   tpops_unbound      kwargs: path
+#   hwclock_sync       kwargs: -
+#   ping_localhost     kwargs: -
+#   python_version     kwargs: -  (按 os-release ID 查期望版本)
+#   path_perm_min      kwargs: path (glob，逗号分隔), value (八进制最小权限)
+#   pkgmgr_ok          kwargs: -
+#   numa_balanced      kwargs: -
 # ---------------------------------------------------------------
 
-# 这里数据分两部分：
-# - 自动可判定的（带 predicate）: 大部分 sysctl/ulimit/service/pkg/port 等
-# - 仅展示原命令输出的: 物理机特定 / 需要人工核对的
+# 所有检查项都由 _check_one() 自动判定，结果只有三种：
+#   OK       符合预期（强制项和非强制项相同）
+#   NOT OK   不符合预期且 mandatory=True
+#   WARNING  不符合预期且 mandatory=False
+# mandatory 的取值以 主机管理标准化检查项.md 的「是否强制校验」列为准。
 
 CHECKS: List[CheckDef] = [
     # ===== CPU 和内存 =====
-    CheckDef(100001, "vCPU核数 >= 4", "CPU和内存", "show",
+    CheckDef(100001, "vCPU核数 >= 4", "CPU和内存", "cpu_cores",
              expected=">= 4",
-             cmd="lscpu | grep '^CPU(s):' | awk '{print $2}'"),
-    CheckDef(100002, "CPU型号为推荐", "CPU和内存", "show",
+             value="4"),
+    CheckDef(100002, "CPU型号为推荐", "CPU和内存", "cpu_model",
              expected="Intel Xeon Gold 6248R/5318Y, Hygon 7280, Kunpeng 920",
-             cmd="lscpu | grep 'Model name'"),
-    CheckDef(100003, "内存 >= 16G", "CPU和内存", "show",
+             value="Xeon Gold 6248R,Xeon Gold 5318Y,Hygon 7280,Kunpeng 920"),
+    CheckDef(100003, "内存 >= 16G", "CPU和内存", "mem_gb",
              expected=">= 16G",
-             cmd="free -g | grep Mem"),
-    CheckDef(100004, "CPU内存比 1:4 或 1:8", "CPU和内存", "show",
-             expected="1:4 or 1:8",
-             cmd="lscpu | grep '^CPU(s):'"),
+             value="16"),
+    CheckDef(100004, "CPU内存比 1:4 或 1:8", "CPU和内存", "cpu_mem_ratio",
+             expected="内存/核数 = 4 或 8 (±0.5)",
+             value="4,8"),
 
     # ===== 磁盘 =====
-    CheckDef(100005, "磁盘类型推荐", "磁盘", "show",
-             expected="SAS/SATA/NVMe SSD",
-             cmd="lsblk -d -o name,rota",
+    CheckDef(100005, "磁盘类型推荐", "磁盘", "disk_rotational",
+             expected="所有磁盘 rota=0 (SSD)",
              fix_refs=["准备数据盘", "准备系统盘"]),
-    CheckDef(100006, "数据盘无分区无挂载", "磁盘", "show",
+    CheckDef(100006, "数据盘无分区无挂载", "磁盘", "data_disk_clean",
              expected="无分区无挂载",
-             cmd="lsblk -f",
-             mandatory=True, container_check=False,
+             mandatory=True,
              fix_refs=["准备数据盘"]),
-    CheckDef(100009, "磁盘盘符不混用", "磁盘", "show",
+    CheckDef(100009, "磁盘盘符不混用", "磁盘", "disk_naming",
              expected="不要 sd 和 vd 混用",
-             cmd="lsblk -d -o name",
-             mandatory=True, container_check=False,
+             mandatory=True,
              fix_refs=["准备数据盘", "准备系统盘"]),
-    CheckDef(100069, "系统盘非多磁盘", "磁盘", "show",
+    CheckDef(100069, "系统盘非多磁盘", "磁盘", "sysdisk_single",
              expected="单盘",
-             cmd="lsblk -d -o name | grep -v loop",
-             mandatory=True, container_check=False,
+             mandatory=True,
              fix_refs=["准备系统盘"]),
-    CheckDef(100070, "系统盘非 NVMe", "磁盘", "show",
+    CheckDef(100070, "系统盘非 NVMe", "磁盘", "sysdisk_not_nvme",
              expected="SAS/SATA SSD",
-             cmd="lsblk -d -o name,rota",
-             mandatory=True, container_check=False,
+             mandatory=True,
              fix_refs=["准备系统盘"]),
 
     # ===== 操作系统版本 =====
-    CheckDef(100011, "OS 版本受支持", "操作系统版本", "show",
+    CheckDef(100011, "OS 版本受支持", "操作系统版本", "os_supported",
              expected="麒麟V10 SP1-3 / 统信V20 / HCE 2.0 / SUSE 12 SP5 / BCLINUX 21.10",
-             cmd="cat /etc/os-release",
              mandatory=True,
              fix_refs=["准备系统盘"]),
 
@@ -293,72 +310,62 @@ CHECKS: List[CheckDef] = [
     CheckDef(100012, "iptables active & enabled", "系统服务", "service_active",
              expected="active+enabled",
              key="iptables",
-             mandatory=True, container_check=False,
+             mandatory=True,
              fix_refs=["配置操作系统防火墙", "配置系统服务"]),
     CheckDef(100061, "cgconfig active & enabled", "系统服务", "service_active",
              expected="active+enabled",
              key="cgconfig",
-             mandatory=True, container_check=False,
+             mandatory=True,
              fix_refs=["配置系统服务"]),
     CheckDef(100013, "firewalld 关闭", "系统服务", "service_inactive",
              expected="inactive",
              key="firewalld",
-             mandatory=True, container_check=False,
+             mandatory=True,
              fix_refs=["配置操作系统防火墙"]),
     CheckDef(100078, "rngd/haveged 开启", "系统服务", "service_active",
              expected="active+enabled",
              key="rngd",
-             mandatory=True, container_check=False,
+             mandatory=True,
              fix_refs=["配置系统服务"]),
 
     # ===== 时间同步 =====
     CheckDef(100014, "NTP/Chrony 启用 & 同步", "时间同步", "service_active",
              expected="chronyd or ntpd active+enabled, drift < 1s",
              key="chronyd",
-             mandatory=True, container_check=False,
+             mandatory=True,
              fix_refs=["设置时钟源"]),
-    CheckDef(100054, "硬件时钟已同步", "时间同步", "show",
+    CheckDef(100054, "硬件时钟已同步", "时间同步", "hwclock_sync",
              expected="System clock synchronized: yes",
-             cmd="timedatectl status | grep 'System clock synchronized'",
-             container_check=False,
-             fix_refs=["设置时钟源"]),
-    CheckDef(100073, "主机与 TPOPS 时钟源一致", "时间同步", "show",
-             expected="时钟源 IP 与 TPOPS 节点一致",
-             cmd="chronyc sources",
-             container_check=False,
              fix_refs=["设置时钟源"]),
 
     # ===== 字符集 =====
-    CheckDef(100015, "字符集 en_US.UTF-8", "字符集参数", "show",
+    CheckDef(100015, "字符集 en_US.UTF-8", "字符集参数", "locale_utf8",
              expected="en_US.UTF-8",
-             cmd="locale | grep LANG",
              mandatory=True,
              fix_refs=["设置字符集参数"]),
 
     # ===== MTU =====
-    CheckDef(100016, "万兆网卡 MTU 1500/8192", "网卡MTU值", "show",
+    CheckDef(100016, "万兆网卡 MTU 1500/8192", "网卡MTU值", "mtu_ok",
              expected="X86: 1500, ARM: 8192",
-             cmd="ifconfig | grep -i mtu",
-             container_check=True,
+             value="1500,8192",
              fix_refs=["设置网卡MTU值"]),
 
     # ===== HISTORY =====
-    CheckDef(100017, "/etc/profile HISTSIZE=0", "HISTORY记录", "show",
+    CheckDef(100017, "/etc/profile HISTSIZE=0", "HISTORY记录", "histsize_zero",
              expected="HISTSIZE=0",
-             cmd="grep -E '^HISTSIZE=' /etc/profile",
-             container_check=True,
              fix_refs=["关闭HISTORY记录"]),
 
     # ===== Python3 =====
-    CheckDef(100018, "Python3 版本正确", "Python3", "show",
+    CheckDef(100018, "Python3 版本正确", "Python3", "python_version",
              expected="麒麟/统信/BCLINUX: 3.7.9, HCE: 3.9.9, SUSE: 3.8.5",
-             cmd="python3 --version",
              mandatory=True,
              fix_refs=["安装主机的Python3"]),
-    CheckDef(100071, "Python3 沿路权限 >= 555", "Python3", "show",
+    CheckDef(100071, "Python3 沿路权限 >= 555", "Python3", "path_perm_min",
              expected=">= 555",
-             cmd="ls -ld /usr/lib/python3* /usr/lib64/python3* /usr/local/lib/python3* /usr/local/lib64/python3* /usr/local/python3/lib/python3* 2>/dev/null",
-             mandatory=True, container_check=False,
+             value="555",
+             path="/usr/lib/python3*,/usr/lib64/python3*,/usr/local/lib/python3*,"
+                  "/usr/local/lib64/python3*,/usr/local/python3/lib/python3*",
+             mandatory=True,
              fix_refs=["Python3第三方库和模块的沿路权限"]),
 
     # ===== Cgroup =====
@@ -367,147 +374,14 @@ CHECKS: List[CheckDef] = [
              mandatory=True,
              fix_refs=["安装主机的Python3"]),  # 文档未给 cgroup 安装章节，挂此处仅占位
 
-    # ===== 操作系统参数 sysctl =====
-    CheckDef(100020, "net.ipv4.tcp_max_tw_buckets = 10000", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_max_tw_buckets", value="10000",
-             expected="10000",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100021, "net.ipv4.tcp_tw_reuse = 1", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_tw_reuse", value="1",
-             expected="1",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100022, "net.ipv4.tcp_tw_recycle = 1", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_tw_recycle", value="1",
-             expected="1",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100023, "net.ipv4.tcp_keepalive_time = 30", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_keepalive_time", value="30",
-             expected="30",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100024, "net.ipv4.tcp_keepalive_probes = 9", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_keepalive_probes", value="9",
-             expected="9",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100025, "net.ipv4.tcp_keepalive_intvl = 30", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_keepalive_intvl", value="30",
-             expected="30",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100026, "net.ipv4.tcp_retries1 = 5", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_retries1", value="5",
-             expected="5",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100027, "net.ipv4.tcp_syn_retries = 5", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_syn_retries", value="5",
-             expected="5",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100028, "net.ipv4.tcp_synack_retries = 5", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_synack_retries", value="5",
-             expected="5",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100029, "net.ipv4.tcp_retries2 = 12", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_retries2", value="12",
-             expected="12",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100030, "vm.overcommit_memory = 0", "操作系统参数", "sysctl_eq",
-             key="vm.overcommit_memory", value="0",
-             expected="0",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100031, "net.ipv4.tcp_rmem = 8192 250000 16777216", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_rmem", value="8192\t250000\t16777216",
-             expected="8192 250000 16777216",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100032, "net.ipv4.tcp_wmem = 8192 250000 16777216", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_wmem", value="8192\t250000\t16777216",
-             expected="8192 250000 16777216",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100033, "net.core.wmem_max = 21299200", "操作系统参数", "sysctl_eq",
-             key="net.core.wmem_max", value="21299200",
-             expected="21299200",
-             container_check=False,
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100034, "net.core.rmem_max = 21299200", "操作系统参数", "sysctl_eq",
-             key="net.core.rmem_max", value="21299200",
-             expected="21299200",
-             container_check=False,
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100035, "net.core.wmem_default = 21299200", "操作系统参数", "sysctl_eq",
-             key="net.core.wmem_default", value="21299200",
-             expected="21299200",
-             container_check=False,
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100036, "net.core.rmem_default = 21299200", "操作系统参数", "sysctl_eq",
-             key="net.core.rmem_default", value="21299200",
-             expected="21299200",
-             container_check=False,
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100037, "net.ipv4.ip_local_port_range = 26000 65535", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.ip_local_port_range", value="26000\t65535",
-             expected="26000 65535",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100038, "kernel.sem = 250 6400000 1000 25600", "操作系统参数", "sysctl_eq",
-             key="kernel.sem", value="250\t6400000\t1000\t25600",
-             expected="250 6400000 1000 25600",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100039, "vm.min_free_kbytes >= 5% 内存", "操作系统参数", "show",
-             expected="min_free_kbytes * 100 / MemTotal >= 5",
-             cmd="sysctl vm.min_free_kbytes; echo '---'; grep MemTotal /proc/meminfo",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100040, "net.core.somaxconn = 65535", "操作系统参数", "sysctl_eq",
-             key="net.core.somaxconn", value="65535",
-             expected="65535",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100041, "net.ipv4.tcp_syncookies = 1", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_syncookies", value="1",
-             expected="1",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100042, "net.core.netdev_max_backlog = 65535", "操作系统参数", "sysctl_eq",
-             key="net.core.netdev_max_backlog", value="65535",
-             expected="65535",
-             container_check=False,
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100043, "net.ipv4.tcp_max_syn_backlog = 65535", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_max_syn_backlog", value="65535",
-             expected="65535",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100044, "net.ipv4.tcp_fin_timeout = 60", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_fin_timeout", value="60",
-             expected="60",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100045, "kernel.shmall = 1152921504606846720", "操作系统参数", "sysctl_eq",
-             key="kernel.shmall", value="1152921504606846720",
-             expected="1152921504606846720",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100046, "kernel.shmmax = 18446744073709551615", "操作系统参数", "sysctl_eq",
-             key="kernel.shmmax", value="18446744073709551615",
-             expected="18446744073709551615",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100047, "net.ipv4.tcp_sack = 1", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_sack", value="1",
-             expected="1",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100048, "net.ipv4.tcp_timestamps = 1", "操作系统参数", "sysctl_eq",
-             key="net.ipv4.tcp_timestamps", value="1",
-             expected="1",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100049, "vm.extfrag_threshold = 500", "操作系统参数", "sysctl_eq",
-             key="vm.extfrag_threshold", value="500",
-             expected="500",
-             fix_refs=["配置操作系统参数"]),
-    CheckDef(100050, "vm.overcommit_ratio = 90", "操作系统参数", "sysctl_eq",
-             key="vm.overcommit_ratio", value="90",
-             expected="90",
-             fix_refs=["配置操作系统参数"]),
-
     # ===== 文件系统参数 ulimit =====
     CheckDef(100051, "ulimit -Sn >= 1000000", "文件系统参数", "ulimit_min",
              key="-Sn", value="1000000",
              expected=">= 1000000",
-             container_check=False,
              fix_refs=["配置文件系统参数"]),
     CheckDef(100052, "ulimit -Hn >= 1000000", "文件系统参数", "ulimit_min",
              key="-Hn", value="1000000",
              expected=">= 1000000",
-             container_check=False,
              fix_refs=["配置文件系统参数"]),
     CheckDef(100053, "stack size = 3072", "文件系统参数", "ulimit_eq",
              key="stack", value="3072",
@@ -527,17 +401,16 @@ CHECKS: List[CheckDef] = [
              key="unzip", expected="installed",
              mandatory=True,
              fix_refs=["安装unzip"]),
-    CheckDef(100057, "软件包管理器已配置", "软件包管理器", "show",
-             expected="yum list libtar / zypper lr",
-             cmd="yum list libtar 2>/dev/null || zypper lr 2>/dev/null",
-             mandatory=True, container_check=False,
+    CheckDef(100057, "软件包管理器已配置", "软件包管理器", "pkgmgr_ok",
+             expected="yum/dnf/zypper 仓库可用",
+             mandatory=True,
              fix_refs=["配置软件包管理器"]),
 
     # ===== 沙箱目录 =====
-    CheckDef(100008, "沙箱目录 /var/chroot 为空", "沙箱目录", "show",
+    CheckDef(100008, "沙箱目录 /var/chroot 为空", "沙箱目录", "dir_empty",
              expected="目录不存在或为空",
-             cmd="ls -Al /var/chroot 2>&1 | head -3",
-             mandatory=True, container_check=False,
+             path="/var/chroot",
+             mandatory=True,
              fix_refs=["清空沙箱目录"]),
 
     # ===== /etc/profile =====
@@ -547,27 +420,14 @@ CHECKS: List[CheckDef] = [
              fix_refs=["配置/etc/profile文件"]),
 
     # ===== NUMA =====
-    CheckDef(100062, "NUMA 分布均衡", "NUMA分布情况", "show",
-             expected="各 NUMA 节点内存均匀",
-             cmd="lscpu | grep NUMA",
-             mandatory=True, container_check=False,
+    CheckDef(100062, "NUMA 分布均衡", "NUMA分布情况", "numa_balanced",
+             expected="各 NUMA 节点内存差异 <= 20%",
+             mandatory=True,
              fix_refs=[]),
 
-    # ===== 网络通信 =====
-    CheckDef(100063, "TPOPS 8601 端口可达", "网络通信检查", "show",
-             expected="curl 成功",
-             cmd="ss -tunlp 2>/dev/null | grep :8601 || echo 'no listener'",
-             mandatory=True,
-             fix_refs=["网络通信检查"]),
-    CheckDef(100064, "TPOPS 10022 端口可达", "网络通信检查", "show",
-             expected="curl 成功",
-             cmd="ss -tunlp 2>/dev/null | grep :10022 || echo 'no listener'",
-             mandatory=True,
-             fix_refs=["网络通信检查"]),
-    CheckDef(100065, "ping localhost 成功", "网络通信检查", "show",
+    CheckDef(100065, "ping localhost 成功", "网络通信检查", "ping_localhost",
              expected="0% loss",
-             cmd="ping -c 2 -W 2 localhost 2>&1 | tail -2",
-             mandatory=True, container_check=False,
+             mandatory=True,
              fix_refs=["网络通信检查"]),
 
     # ===== 网络端口占用检查 =====
@@ -590,28 +450,21 @@ CHECKS: List[CheckDef] = [
     # ===== hosts =====
     CheckDef(100072, "/etc/hosts 不同时配置 IPv4+IPv6", "hosts文件", "hosts_ipv6",
              expected="仅 IPv4 或仅 IPv6，不能同时",
-             mandatory=True, container_check=False,
+             mandatory=True,
              fix_refs=["检查hosts文件"]),
 
     # ===== om_agent =====
     CheckDef(100074, "无 om_agent 进程残留", "om_agent进程", "om_agent",
              expected="无残留",
-             mandatory=True, container_check=False,
+             mandatory=True,
              fix_refs=["检查om_agent进程"]),
 
     # ===== TPOPS 标识码 =====
-    CheckDef(100075, "主机未在其他 TPOPS 上添加", "TPOPS标识码", "show",
-             expected="host_unique_code 不存在或已解绑",
-             cmd="cat /dbs/osPatch/host_unique_code 2>/dev/null || echo 'not exist'",
+    CheckDef(100075, "主机未在其他 TPOPS 上添加", "TPOPS标识码", "tpops_unbound",
+             expected="host_unique_code 不存在或为空",
+             path="/dbs/osPatch/host_unique_code",
              mandatory=True,
              fix_refs=["检查TPOPS标识码"]),
-
-    # ===== 添加主机机房名 =====
-    CheckDef(100080, "机房名与数据库 AZ 一致", "添加主机时所选的机房名称", "show",
-             expected="机房名 = cm_ctl query 中的 AZ",
-             cmd="(su - omm -c 'source ~/gauss_env_file 2>/dev/null; cm_ctl query -CvzALL 2>/dev/null' | grep -i az) || echo 'no db installed'",
-             mandatory=True,
-             fix_refs=["检查实例安装使用的AZ名称"]),
 
     # ===== /etc/security =====
     CheckDef(100081, "/etc/security 权限正确", "/etc/security", "security_perm",
@@ -754,43 +607,6 @@ FIX_SECTIONS: Dict[str, Dict] = {
             {"os": None, "cmd": "chmod -R 755 /usr/local/lib64/python3* 2>/dev/null || true"},
         ],
     },
-    "配置操作系统参数": {
-        "os_filter": None,
-        "commands": [
-            # 在 /etc/sysctl.conf 末尾追加所有期望值（仅当缺失时追加）
-            # 每个 key=value 用一行内联命令实现 grep+sed 或 echo append
-            {"os": None, "cmd": "k=net.ipv4.tcp_max_tw_buckets; v=10000; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.ipv4.tcp_tw_reuse; v=1; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.ipv4.tcp_keepalive_time; v=30; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.ipv4.tcp_keepalive_probes; v=9; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.ipv4.tcp_keepalive_intvl; v=30; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.ipv4.tcp_retries1; v=5; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.ipv4.tcp_syn_retries; v=5; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.ipv4.tcp_synack_retries; v=5; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.ipv4.tcp_retries2; v=12; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=vm.overcommit_memory; v=0; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.ipv4.tcp_rmem; v='8192 250000 16777216'; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.ipv4.tcp_wmem; v='8192 250000 16777216'; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.core.wmem_max; v=21299200; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.core.rmem_max; v=21299200; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.core.wmem_default; v=21299200; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.core.rmem_default; v=21299200; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.ipv4.ip_local_port_range; v='26000 65535'; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=kernel.sem; v='250 6400000 1000 25600'; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.core.somaxconn; v=65535; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.ipv4.tcp_syncookies; v=1; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.core.netdev_max_backlog; v=65535; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.ipv4.tcp_max_syn_backlog; v=65535; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.ipv4.tcp_fin_timeout; v=60; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=kernel.shmall; v=1152921504606846720; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=kernel.shmmax; v=18446744073709551615; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.ipv4.tcp_sack; v=1; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=net.ipv4.tcp_timestamps; v=1; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=vm.extfrag_threshold; v=500; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "k=vm.overcommit_ratio; v=90; grep -q \"^${k}\" /etc/sysctl.conf 2>/dev/null && sed -i \"s|^${k}=.*|${k}=${v}|\" /etc/sysctl.conf || echo \"${k}=${v}\" >> /etc/sysctl.conf"},
-            {"os": None, "cmd": "sysctl -p 2>/dev/null || true"},
-        ],
-    },
     "配置文件系统参数": {
         "os_filter": None,
         "commands": [
@@ -851,10 +667,6 @@ FIX_SECTIONS: Dict[str, Dict] = {
         "commands": [],  # 不自动 kill，仅检查
     },
     "检查TPOPS标识码": {
-        "os_filter": None,
-        "commands": [],  # 仅检查
-    },
-    "检查实例安装使用的AZ名称": {
         "os_filter": None,
         "commands": [],  # 仅检查
     },
@@ -929,8 +741,6 @@ class CheckResult:
         """根据状态 + 强制标志返回严重程度标签."""
         if self.status == Status.PASS:
             return "OK"
-        if self.status == Status.SKIP:
-            return "SKIP"
         if self.status == Status.ERROR:
             return "ERROR"
         # FAIL
@@ -969,8 +779,6 @@ class CheckResult:
             return f"{C_YELLOW}{s}{C_RESET}"
         if s == "NOT OK":
             return f"{C_RED}{C_BOLD}{s}{C_RESET}"
-        if s == "SKIP":
-            return f"{C_DIM}{s}{C_RESET}"
         return f"{C_MAGENTA}{s}{C_RESET}"
 
 
@@ -982,29 +790,227 @@ def _is_port_listening(port: int) -> bool:
     return rc2 == 0 and out2.strip() != ""
 
 
+# ---------------------------------------------------------------
+# 主机信息采集工具（供 check_type 分支复用）
+# ---------------------------------------------------------------
+
+_SUPPORTED_OS_HUMAN = "麒麟V10 SP1-3 / 统信V20 / HCE 2.0 / SUSE 12 SP5 / BCLINUX 21.10"
+# os-release ID -> 允许的 VERSION_ID 集合
+_SUPPORTED_OS: Dict[str, Set[str]] = {
+    "kylin": {"V10", "(V10)"},
+    "uos": {"20", "20.0"},
+    "hce": {"2.0", "2"},
+    "sles": {"12.5"},
+    "bclinux": {"21.10"},
+}
+# os-release ID -> 期望的 python3 版本
+_PYTHON_BY_OS: Dict[str, str] = {
+    "kylin": "3.7.9",
+    "uos": "3.7.9",
+    "bclinux": "3.7.9",
+    "hce": "3.9.9",
+    "sles": "3.8.5",
+}
+
+
+def _cpu_cores() -> int:
+    """逻辑核数。"""
+    rc, out, _ = run_shell("nproc 2>/dev/null")
+    try:
+        return int(out.strip())
+    except ValueError:
+        pass
+    rc, out, _ = run_shell("grep -c '^processor' /proc/cpuinfo 2>/dev/null")
+    try:
+        return int(out.strip())
+    except ValueError:
+        return 0
+
+
+def _cpu_model() -> str:
+    rc, out, _ = run_shell("lscpu 2>/dev/null | grep -m1 'Model name'")
+    if rc != 0 or not out.strip():
+        rc, out, _ = run_shell("grep -m1 'model name' /proc/cpuinfo 2>/dev/null")
+    m = re.search(r":\s*(.+)", out.strip())
+    return m.group(1).strip() if m else out.strip()
+
+
+def _mem_total_gb() -> float:
+    """物理内存总量 (GB)，取 /proc/meminfo 的 MemTotal。"""
+    try:
+        for line in open("/proc/meminfo", encoding="utf-8", errors="ignore"):
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) / (1024 * 1024)
+    except Exception:
+        pass
+    rc, out, _ = run_shell("free -g 2>/dev/null | awk '/^Mem:/{print $2}'")
+    try:
+        return float(out.strip())
+    except ValueError:
+        return 0.0
+
+
+def _lsblk_disks() -> List[Tuple[str, str]]:
+    """返回 [(盘名, rota)]，只取 TYPE=disk 的物理盘（已剔除 loop/rom）。"""
+    rc, out, _ = run_shell(
+        "lsblk -d -n -o NAME,ROTA,TYPE 2>/dev/null | awk '$3==\"disk\"{print $1, $2}'")
+    disks: List[Tuple[str, str]] = []
+    for line in out.strip().splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] not in ("loop", "rom", "sr"):
+            disks.append((parts[0], parts[1]))
+    return disks
+
+
+def _mount_source_for(path: str) -> str:
+    """路径所在的底层块设备名（/dev/sda -> sda），非块设备返回 ""。"""
+    try:
+        real = os.path.realpath(path)
+        name = os.path.basename(real)
+        if not name:
+            return ""
+        # 去掉分区号后缀：sda1 -> sda, nvme0n1p1 -> nvme0n1
+        m = re.match(r"^(.+?)(?:p?\d+)$", name)
+        return m.group(1) if m else name
+    except Exception:
+        return ""
+
+
+def _system_disks() -> List[str]:
+    """承载根目录 "/" 的物理盘列表。"""
+    sysdisk = _mount_source_for("/")
+    disks = [n for n, _ in _lsblk_disks()]
+    if sysdisk and sysdisk in disks:
+        return [sysdisk]
+    # 根在 overlay/网络文件系统等场景下，回退为所有物理盘
+    return disks
+
+
+def _dirty_data_disks() -> List[str]:
+    """有分区或被挂载的数据盘（非系统盘）。"""
+    sysdisk = _mount_source_for("/")
+    rc, out, _ = run_shell(
+        "lsblk -n -o NAME,TYPE,MOUNTPOINT 2>/dev/null")
+    dirty: List[str] = []
+    for line in out.strip().splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        name, ntype = parts[0], (parts[1] if len(parts) > 1 else "")
+        if ntype != "disk" or name == sysdisk:
+            continue
+        mounted = " ".join(parts[2:]).strip()
+        if mounted:
+            dirty.append(f"{name}(已挂载:{mounted})")
+            continue
+        # 该盘下是否有分区
+        rc2, out2, _ = run_shell(f"lsblk -n -o TYPE {name} 2>/dev/null | tail -n +2")
+        if any(t.strip() == "part" for t in out2.strip().splitlines()):
+            dirty.append(f"{name}(有分区)")
+    return dirty
+
+
+# 已知盘符前缀，从长到短匹配；必须先匹配长的（避免 "sd" 截走 "nvme"）
+_DISK_PREFIXES = ("nvme", "xvd", "sd", "vd", "hd")
+
+
+def _disk_name_kind(name: str) -> str:
+    """取盘符前缀。nvme0n1→nvme, sda→sd, sdb1→sd, vda→vd, xvdb→xvd。"""
+    for p in _DISK_PREFIXES:
+        if name.startswith(p):
+            return p
+    # 未知前缀：去掉尾部字母直到首字符为字母 + 后续至少一位字母
+    m = re.match(r"^([a-z]+?)(?=\d|$)", name)
+    return m.group(1) if m else name
+
+
+def _disk_name_kinds() -> Set[str]:
+    """磁盘盘符前缀集合：sd / vd / xvd / nvme / hd ..."""
+    return {_disk_name_kind(n) for n, _ in _lsblk_disks()}
+
+
+def _os_version_supported(os_id: str, ver: str) -> Tuple[bool, str]:
+    allowed = _SUPPORTED_OS.get(os_id)
+    human = f"{os_id or 'unknown'} {ver}".strip()
+    if not allowed:
+        return False, human
+    norm = ver.strip().upper()
+    return norm in allowed or norm.lstrip("(").rstrip(")") in allowed, human
+
+
+def _expected_python_version(host: HostInfo) -> str:
+    return _PYTHON_BY_OS.get(host.os_id.lower(), "")
+
+
+def _current_lang() -> str:
+    """当前 LANG，依次查环境变量 / /etc/locale.conf / /etc/locale。"""
+    lang = os.environ.get("LANG", "")
+    if lang:
+        return lang.strip()
+    for p in ("/etc/locale.conf", "/etc/locale"):
+        if os.path.exists(p):
+            try:
+                for line in open(p, encoding="utf-8", errors="ignore"):
+                    if line.strip().startswith("LANG="):
+                        return line.split("=", 1)[1].strip().strip('"')
+            except Exception:
+                pass
+    rc, out, _ = run_shell("locale 2>/dev/null | grep -m1 '^LANG='")
+    return out.strip().replace("LANG=", "").strip()
+
+
+def _nic_mtus() -> List[int]:
+    """所有非 lo 网卡的 MTU 列表。"""
+    rc, out, _ = run_shell(
+        "ip -o link show 2>/dev/null | awk -F': ' '{print $2, $NF}'")
+    mtus: List[int] = []
+    for line in out.strip().splitlines():
+        parts = line.split()
+        if len(parts) < 2 or parts[0] == "lo":
+            continue
+        m = re.search(r"mtu\s+(\d+)", line)
+        if m:
+            mtus.append(int(m.group(1)))
+    if not mtus:  # 老系统无 ip 命令，回退 ifconfig
+        rc, out, _ = run_shell("ifconfig 2>/dev/null | grep -o 'MTU:[0-9]*'")
+        for line in out.strip().splitlines():
+            m = re.search(r"(\d+)", line)
+            if m:
+                mtus.append(int(m.group(1)))
+    return mtus
+
+
+def _numa_mem_sizes_mb() -> List[int]:
+    """各 NUMA 节点的内存大小 (MB)。无法获取时返回空列表。"""
+    rc, out, _ = run_shell("numactl --hardware 2>/dev/null")
+    sizes: List[int] = []
+    if rc == 0 and out.strip():
+        for line in out.splitlines():
+            m = re.match(r"^node\s+\d+\s+size:\s+(\d+)\s*MB", line.strip(), re.I)
+            if m:
+                sizes.append(int(m.group(1)))
+        if sizes:
+            return sizes
+    # 回退：/sys/devices/system/node/nodeN/meminfo
+    try:
+        for d in sorted(os.listdir("/sys/devices/system/node")):
+            m = re.match(r"^node(\d+)$", d)
+            if not m:
+                continue
+            with open(f"/sys/devices/system/node/{d}/meminfo",
+                      encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    if "MemTotal" in line:
+                        sizes.append(int(line.split()[-2]) // 1024)
+                        break
+    except Exception:
+        pass
+    return sizes
+
+
 def _check_one(c: CheckDef, host: HostInfo) -> CheckResult:
     """执行单个 check，返回结果."""
-    # Container/物理机过滤
-    if c.container_check is False and host.is_container:
-        return CheckResult(c.id, c.name, Status.SKIP, message="容器环境跳过（仅物理机检查）",
-                             mandatory=c.mandatory)
-    if c.container_check is True and not host.is_container and c.check_type == "show":
-        # 物理机非容器的项不强制过滤；保留
-        pass
-
     try:
-        if c.check_type == "sysctl_eq":
-            actual = _sysctl_value(c.key)
-            ok = (actual == c.value)
-            return CheckResult(
-                c.id, c.name,
-                Status.PASS if ok else Status.FAIL,
-                current=actual, expected=c.value,
-                message="OK" if ok else f"期望 {c.value} 实际 {actual}",
-                fix_refs=c.fix_refs,
-                mandatory=c.mandatory,
-            )
-
         if c.check_type == "ulimit_min":
             rc, out, _ = run_shell(f"ulimit {c.key}")
             actual = out.strip()
@@ -1193,15 +1199,333 @@ def _check_one(c: CheckDef, host: HostInfo) -> CheckResult:
                 mandatory=c.mandatory,
             )
 
-        if c.check_type == "show":
-            rc, out, err = run_shell(c.cmd, timeout=15)
-            current = (out.strip().splitlines() or [""])[0][:80]
+        # ---------- CPU 和内存 ----------
+        if c.check_type == "cpu_cores":
+            cores = _cpu_cores()
+            want = int(c.value or 4)
+            ok = cores >= want
             return CheckResult(
-                c.id, c.name, Status.SKIP,
-                current=current, expected=c.expected,
-                message=f"(手工核对) rc={rc}; first line: {current}",
-                fix_refs=c.fix_refs,
-                mandatory=c.mandatory,
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=f"{cores} 核",
+                expected=c.expected,
+                message="OK" if ok else f"vCPU {cores} < {want}",
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        if c.check_type == "cpu_model":
+            model = _cpu_model()
+            keys = [k.strip() for k in (c.value or "").split(",") if k.strip()]
+            ok = any(k.lower() in model.lower() for k in keys)
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=model or "(未知)",
+                expected=c.expected,
+                message="OK" if ok else f"CPU 型号不在推荐列表: {model or '(未知)'}",
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        if c.check_type == "mem_gb":
+            mem_gb = _mem_total_gb()
+            want = float(c.value or 16)
+            ok = mem_gb >= want
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=f"{mem_gb:.1f} G",
+                expected=c.expected,
+                message="OK" if ok else f"内存 {mem_gb:.1f}G < {want:g}G",
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        if c.check_type == "cpu_mem_ratio":
+            cores = _cpu_cores()
+            mem_gb = _mem_total_gb()
+            targets = [float(x) for x in (c.value or "4,8").split(",") if x.strip()]
+            ratio = mem_gb / cores if cores else 0.0
+            ok = any(abs(ratio - t) <= 0.5 for t in targets)
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=f"1:{ratio:.1f} ({cores} 核 / {mem_gb:.1f}G)",
+                expected=c.expected,
+                message="OK" if ok else f"内存/核数 = 1:{ratio:.1f}，推荐 1:4 或 1:8 (±0.5)",
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        # ---------- 磁盘 ----------
+        if c.check_type == "disk_rotational":
+            rota = [n for n, r in _lsblk_disks() if r == "1"]
+            ok = not rota
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current="全部 SSD" if ok else f"机械盘: {', '.join(rota)}",
+                expected=c.expected,
+                message="OK" if ok else f"存在机械盘 (rota=1): {', '.join(rota)}",
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        if c.check_type == "data_disk_clean":
+            bad = _dirty_data_disks()
+            ok = not bad
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current="数据盘干净" if ok else f"不干净: {', '.join(bad)}",
+                expected=c.expected,
+                message="OK" if ok else f"以下数据盘存在分区或挂载: {', '.join(bad)}",
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        if c.check_type == "disk_naming":
+            kinds = _disk_name_kinds()
+            ok = len(kinds) <= 1
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=", ".join(sorted(kinds)) or "(无磁盘)",
+                expected=c.expected,
+                message="OK" if ok else f"盘符前缀混用: {', '.join(sorted(kinds))}",
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        if c.check_type == "sysdisk_single":
+            sysdisks = _system_disks()
+            ok = len(sysdisks) == 1
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=", ".join(sysdisks) or "(未找到)",
+                expected=c.expected,
+                message="OK" if ok else f"系统盘应为单盘，实际 {len(sysdisks)} 块: {', '.join(sysdisks)}",
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        if c.check_type == "sysdisk_not_nvme":
+            sysdisks = _system_disks()
+            nvme = [d for d in sysdisks if d.startswith("nvme")]
+            ok = not nvme
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=", ".join(sysdisks) or "(未找到)",
+                expected=c.expected,
+                message="OK" if ok else f"系统盘不能使用 NVMe: {', '.join(nvme)}",
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        # ---------- 操作系统 ----------
+        if c.check_type == "os_supported":
+            data = _read_os_release()
+            os_id = data.get("ID", "").lower()
+            ver = data.get("VERSION_ID", "")
+            ok, human = _os_version_supported(os_id, ver)
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=f"{os_id or 'unknown'} {ver}".strip(),
+                expected=c.expected,
+                message="OK" if ok else f"不支持的操作系统: {human}；支持: " + _SUPPORTED_OS_HUMAN,
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        if c.check_type == "locale_utf8":
+            lang = _current_lang()
+            ok = "en_US.utf-8" in lang.lower() or "en_us.utf8" in lang.lower()
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=lang or "(未设置)",
+                expected=c.expected,
+                message="OK" if ok else f"LANG={lang or '(未设置)'}，应为 en_US.UTF-8",
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        # ---------- 网络 / 时钟 ----------
+        if c.check_type == "mtu_ok":
+            mtus = _nic_mtus()
+            allowed = {int(x) for x in (c.value or "1500,8192").split(",") if x.strip()}
+            bad = sorted(m for m in mtus if m not in allowed)
+            ok = bool(mtus) and not bad
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=", ".join(str(m) for m in mtus) or "(未找到网卡)",
+                expected=c.expected,
+                message="OK" if ok else (
+                    f"MTU 非法: {bad}" if bad else "未找到任何网卡 MTU"),
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        if c.check_type == "hwclock_sync":
+            rc, out, _ = run_shell("timedatectl 2>/dev/null")
+            m = re.search(r"System clock synchronized:\s*(\S+)", out) if rc == 0 else None
+            current = m.group(1) if m else "(未知)"
+            ok = (current == "yes")
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=current,
+                expected=c.expected,
+                message="OK" if ok else f"System clock synchronized = {current}",
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        if c.check_type == "ping_localhost":
+            rc, out, _ = run_shell("ping -c 2 -W 2 localhost 2>&1", timeout=15)
+            m = re.search(r"(\d+(?:\.\d+)?)% packet loss", out)
+            loss = f"{float(m.group(1)):g}%" if m else "(未知)"
+            ok = (rc == 0 and m is not None and float(m.group(1)) == 0)
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=f"loss={loss}",
+                expected=c.expected,
+                message="OK" if ok else f"ping localhost 丢包率 {loss}",
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        # ---------- 系统文件 ----------
+        if c.check_type == "histsize_zero":
+            rc, out, _ = run_shell("grep -E '^\\s*HISTSIZE\\s*=' /etc/profile 2>/dev/null")
+            raw = out.strip().splitlines()
+            if not raw:
+                return CheckResult(c.id, c.name, Status.FAIL, current="(未设置)",
+                                   expected=c.expected,
+                                   message="/etc/profile 中未设置 HISTSIZE",
+                                   fix_refs=c.fix_refs, mandatory=c.mandatory)
+            current = raw[-1].strip()
+            val = re.sub(r"^\s*HISTSIZE\s*=\s*", "", current).strip()
+            ok = val in ("0", '"0"', "'0'")
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=current,
+                expected=c.expected,
+                message="OK" if ok else f"{current}，应为 HISTSIZE=0",
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        if c.check_type == "dir_empty":
+            p = c.path
+            if not os.path.isdir(p):
+                return CheckResult(c.id, c.name, Status.PASS, current="目录不存在",
+                                   expected=c.expected, message="OK (目录不存在)",
+                                   fix_refs=c.fix_refs, mandatory=c.mandatory)
+            entries = os.listdir(p)
+            ok = not entries
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=f"{len(entries)} 个条目" if entries else "空",
+                expected=c.expected,
+                message="OK" if ok else f"{p} 非空: {', '.join(entries[:5])}"
+                                          + (" ..." if len(entries) > 5 else ""),
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        if c.check_type == "tpops_unbound":
+            p = c.path
+            code = ""
+            if os.path.exists(p):
+                try:
+                    code = open(p, encoding="utf-8", errors="ignore").read().strip()
+                except Exception:
+                    code = ""
+            ok = not code
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=code or "(不存在/为空)",
+                expected=c.expected,
+                message="OK" if ok else f"{p} 存在标识码 {code}，主机可能已在其他 TPOPS 上添加",
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        # ---------- Python3 / 软件包 / NUMA ----------
+        if c.check_type == "python_version":
+            rc, out, err = run_shell("python3 --version 2>&1", timeout=15)
+            ver = ""
+            m = re.search(r"Python\s+(\d+\.\d+\.\d+)", out or err or "")
+            if m:
+                ver = m.group(1)
+            want = _expected_python_version(host)
+            ok = bool(want) and ver == want
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=ver or "(未安装)",
+                expected=c.expected,
+                message="OK" if ok else (
+                    f"Python3 {ver or '(未安装)'}，{host.os_id} 应为 {want}"
+                    if want else f"无法确定 {host.os_id} 对应的期望 Python3 版本"),
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        if c.check_type == "path_perm_min":
+            patterns = [p for p in c.path.split(",") if p]
+            worst = None
+            detail = ""
+            for pat in patterns:
+                rc, out, _ = run_shell(f"stat -c '%a %n' {pat} 2>/dev/null")
+                for line in out.strip().splitlines():
+                    parts = line.split(None, 1)
+                    if len(parts) != 2 or not parts[0].isdigit():
+                        continue
+                    perm = int(parts[0], 8)
+                    if worst is None or perm < worst:
+                        worst = perm
+                        detail = line.strip()
+            want = int(c.value or "555", 8)
+            ok = worst is not None and worst >= want
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=(f"{worst:o} ({detail})" if worst is not None else "(未找到目录)"),
+                expected=c.expected,
+                message="OK" if ok else (
+                    f"最小权限 {worst:o} < {want:o}" if worst is not None
+                    else "未找到任何 Python3 库目录"),
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        if c.check_type == "pkgmgr_ok":
+            tried, ok_pm = [], None
+            for pm, probe in (("yum", "yum repolist 2>&1 | tail -5"),
+                              ("dnf", "dnf repolist 2>&1 | tail -5"),
+                              ("zypper", "zypper lr 2>&1 | tail -5")):
+                rc, out, _ = run_shell(probe, timeout=30)
+                tried.append(pm)
+                if rc == 0 and out.strip():
+                    ok_pm = pm
+                    break
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok_pm else Status.FAIL,
+                current=ok_pm or f"({'/'.join(tried)} 均不可用)",
+                expected=c.expected,
+                message="OK" if ok_pm else f"{'/'.join(tried)} 仓库查询均失败",
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
+            )
+
+        if c.check_type == "numa_balanced":
+            sizes = _numa_mem_sizes_mb()
+            if len(sizes) <= 1:
+                current = f"{len(sizes)} 个 NUMA 节点"
+                msg, ok = "OK (单 NUMA 节点)", True
+            else:
+                lo, hi = min(sizes), max(sizes)
+                diff = (hi - lo) / hi * 100 if hi else 0.0
+                current = f"{len(sizes)} 节点, 差异 {diff:.1f}%"
+                ok = diff <= 20.0
+                msg = "OK" if ok else f"各 NUMA 节点内存差异 {diff:.1f}% > 20%"
+            return CheckResult(
+                c.id, c.name,
+                Status.PASS if ok else Status.FAIL,
+                current=current, expected=c.expected, message=msg,
+                fix_refs=c.fix_refs, mandatory=c.mandatory,
             )
 
         if c.check_type == "timezone_utc":
@@ -1436,8 +1760,6 @@ def _sev_label(r: CheckResult) -> str:
     """返回彩色化的严重程度标签."""
     if r.status == Status.PASS:
         return f"{C_GREEN}OK       {C_RESET}"
-    if r.status == Status.SKIP:
-        return f"{C_YELLOW}SKIP     {C_RESET}"
     if r.status == Status.ERROR:
         return f"{C_MAGENTA}ERROR    {C_RESET}"
     # FAIL → NOT OK (强制) 或 WARNING (非强制)
@@ -1505,14 +1827,12 @@ def print_check_table(results: List[CheckResult], host: HostInfo,
     print(f"\n{C_BOLD}主机标准化检查报告{C_RESET}")
     print(f"  时间    : {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  操作系统  : {C_CYAN}{host.os_id} {host.os_version}{C_RESET}")
-    print(f"  权限    : {C_CYAN}root={host.is_root}{C_RESET}    "
-          f"环境: {C_CYAN}{'容器' if host.is_container else '物理机'}{C_RESET}")
+    print(f"  权限    : {C_CYAN}root={host.is_root}{C_RESET}")
 
     # ---------- 2. 顶部状态条 ----------
     ok_n = sum(1 for r in results if r.status == Status.PASS)
     not_ok_n = sum(1 for r in results if r.status == Status.FAIL and r.mandatory)
     warn_n = sum(1 for r in results if r.status == Status.FAIL and not r.mandatory)
-    skip_n = sum(1 for r in results if r.status == Status.SKIP)
     err_n = sum(1 for r in results if r.status == Status.ERROR)
     total = len(results)
 
@@ -1532,7 +1852,6 @@ def print_check_table(results: List[CheckResult], host: HostInfo,
           f"{C_GREEN}OK={ok_n}{C_RESET}   "
           f"{C_RED}{C_BOLD}NOT OK={not_ok_n}{C_RESET}   "
           f"{C_YELLOW}WARNING={warn_n}{C_RESET}   "
-          f"{C_DIM}SKIP={skip_n}{C_RESET}   "
           f"{C_MAGENTA}ERROR={err_n}{C_RESET}")
     print(f"{C_DIM}{bar}{C_RESET}\n")
 
@@ -1604,11 +1923,9 @@ def print_check_table(results: List[CheckResult], host: HostInfo,
     optional = [r for r in results if not r.mandatory]
     m_pass = sum(1 for r in mand if r.status == Status.PASS)
     m_fail = sum(1 for r in mand if r.status == Status.FAIL)
-    m_skip = sum(1 for r in mand if r.status == Status.SKIP)
     m_err = sum(1 for r in mand if r.status == Status.ERROR)
     o_pass = sum(1 for r in optional if r.status == Status.PASS)
     o_fail = sum(1 for r in optional if r.status == Status.FAIL)
-    o_skip = sum(1 for r in optional if r.status == Status.SKIP)
     o_err = sum(1 for r in optional if r.status == Status.ERROR)
 
     print(f"\n{C_DIM}{'─' * 64}{C_RESET}")
@@ -1616,12 +1933,10 @@ def print_check_table(results: List[CheckResult], host: HostInfo,
     print(f"  强制项   ({len(mand):>2} 项):  "
           f"{C_GREEN}OK={m_pass}{C_RESET}   "
           f"{C_RED}{C_BOLD}NOT OK={m_fail}{C_RESET}   "
-          f"{C_DIM}SKIP={m_skip}{C_RESET}   "
           f"{C_MAGENTA}ERROR={m_err}{C_RESET}")
     print(f"  非强制项 ({len(optional):>2} 项):  "
           f"{C_GREEN}OK={o_pass}{C_RESET}   "
           f"{C_YELLOW}WARNING={o_fail}{C_RESET}   "
-          f"{C_DIM}SKIP={o_skip}{C_RESET}   "
           f"{C_MAGENTA}ERROR={o_err}{C_RESET}")
     print(f"{C_DIM}{'─' * 64}{C_RESET}")
 
@@ -1660,11 +1975,11 @@ def print_fix_report(steps: List[FixStep]) -> int:
 
 def cmd_list() -> int:
     print(f"{C_BOLD}共 {len(CHECKS)} 项检查{C_RESET}")
-    print(f"  {'ID':<7} {'Category':<14} {'Name':<48} {'Type':<14} Container")
-    print(f"  {'-'*7} {'-'*14} {'-'*48} {'-'*14} {'-'*10}")
+    print(f"  {'ID':<7} {'Category':<14} {'Name':<48} {'Type':<16} Mandatory")
+    print(f"  {'-'*7} {'-'*14} {'-'*48} {'-'*16} {'-'*9}")
     for c in CHECKS:
-        con = "容器" if c.container_check else "物理机"
-        print(f"  {c.id:<7} {c.category:<14} {_truncate(c.name, 47):<48} {c.check_type:<14} {con}")
+        mand = "Y" if c.mandatory else "n"
+        print(f"  {c.id:<7} {c.category:<14} {_truncate(c.name, 47):<48} {c.check_type:<16} {mand}")
     return 0
 
 
@@ -1751,7 +2066,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = p.parse_args(argv)
     if args.no_color:
-        USE_COLOR = False
+        set_color(False)
     return args.func(args)
 
 
