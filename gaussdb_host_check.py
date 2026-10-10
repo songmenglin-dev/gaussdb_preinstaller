@@ -1934,8 +1934,8 @@ def print_check_table(results: List[CheckResult], host: HostInfo,
         item = _truncate(r.display_item, widths[1] - 1)
         cur = _truncate(r.display_current, widths[2] - 1)
         exp = _truncate(r.display_expected, widths[3] - 1)
-        mand_colored = (f"{C_RED}{C_BOLD}是{C_RESET}" if r.mandatory
-                        else f"{C_DIM}否{C_RESET}")
+        mand_colored = (f"{C_RED}{C_BOLD}Y{C_RESET}" if r.mandatory
+                        else f"{C_DIM}N{C_RESET}")
         st_colored = r.display_status_colored
         print("| " + " | ".join([
             _cell(str(idx), widths[0], align=">"),
@@ -2058,8 +2058,8 @@ def cmd_list() -> int:
     )
     sorted_checks = mandatory + optional
     for c in sorted_checks:
-        mand_colored = (f"{C_RED}{C_BOLD}是{C_RESET}" if c.mandatory
-                        else f"{C_DIM}否{C_RESET}")
+        mand_colored = (f"{C_RED}{C_BOLD}Y{C_RESET}" if c.mandatory
+                        else f"{C_DIM}N{C_RESET}")
         print("| " + " | ".join([
             _cell(str(c.id), widths[0], align=">"),
             _cell(c.category, widths[1]),
