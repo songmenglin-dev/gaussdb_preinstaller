@@ -1909,8 +1909,8 @@ def print_check_table(results: List[CheckResult], host: HostInfo,
 
     # ---------- 2. 详细表格 ----------
     # 固定列宽：item 优先，current/expected 给足
-    headers = ["#", "item", "current_value", "expected_value", "M", "status"]
-    widths = [4, 30, 41, 52, 2, 8]   # M 列只放 1 字符的 Y/n
+    headers = ["#", "item", "current_value", "expected_value", "是否强制校验", "status"]
+    widths = [4, 30, 41, 50, 12, 8]   # 是否强制校验：6 CJK × 2 = 12
     # 终端太窄时压缩 current/expected
     term_w = shutil.get_terminal_size((160, 40)).columns
     total_w = sum(widths) + 7 * 2  # 每列两侧 " | " 加首尾 "| "
@@ -1934,8 +1934,8 @@ def print_check_table(results: List[CheckResult], host: HostInfo,
         item = _truncate(r.display_item, widths[1] - 1)
         cur = _truncate(r.display_current, widths[2] - 1)
         exp = _truncate(r.display_expected, widths[3] - 1)
-        mand_colored = (f"{C_RED}{C_BOLD}Y{C_RESET}" if r.mandatory
-                        else f"{C_DIM}n{C_RESET}")
+        mand_colored = (f"{C_RED}{C_BOLD}是{C_RESET}" if r.mandatory
+                        else f"{C_DIM}否{C_RESET}")
         st_colored = r.display_status_colored
         print("| " + " | ".join([
             _cell(str(idx), widths[0], align=">"),
@@ -2037,8 +2037,8 @@ def print_fix_report(steps: List[FixStep]) -> int:
 def cmd_list() -> int:
     print(f"\n{C_BOLD}主机标准化检查项清单{C_RESET}  共 {len(CHECKS)} 项\n")
     # 与 check 表格相同的列宽与对齐策略（视觉宽度，CJK=2）
-    headers = ["ID", "Category", "Name", "Type", "M"]
-    widths = [7, 14, 44, 16, 2]
+    headers = ["ID", "Category", "Name", "Type", "是否强制校验"]
+    widths = [7, 14, 38, 16, 12]
     term_w = shutil.get_terminal_size((140, 40)).columns
     total_w = sum(widths) + 6 * 2  # 5 列 + 5 个 " | " + 首尾 "| "
     if total_w > term_w and widths[2] > 20:
@@ -2058,8 +2058,8 @@ def cmd_list() -> int:
     )
     sorted_checks = mandatory + optional
     for c in sorted_checks:
-        mand_colored = (f"{C_RED}{C_BOLD}Y{C_RESET}" if c.mandatory
-                        else f"{C_DIM}n{C_RESET}")
+        mand_colored = (f"{C_RED}{C_BOLD}是{C_RESET}" if c.mandatory
+                        else f"{C_DIM}否{C_RESET}")
         print("| " + " | ".join([
             _cell(str(c.id), widths[0], align=">"),
             _cell(c.category, widths[1]),
